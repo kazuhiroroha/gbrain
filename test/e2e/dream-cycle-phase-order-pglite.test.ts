@@ -109,6 +109,9 @@ const EXPECTED_PHASES: CyclePhase[] = [
   'patterns',
   'recompute_emotional_weight', // v0.29
   'consolidate',                // v0.31
+  'propose_takes',              // v0.36.1.0 — hindsight calibration wave
+  'grade_takes',                // v0.36.1.0
+  'calibration_profile',        // v0.36.1.0
   'embed',
   'orphans',
   'purge',                       // v0.26.5
