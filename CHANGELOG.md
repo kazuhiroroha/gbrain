@@ -2,6 +2,96 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.37.0.0] - 2026-05-19
+
+**Skillpacks become a real ecosystem. You can ship one, someone else can install it, and gbrain has an opinion about quality.**
+
+Pre-v0.37, skillpacks were one bundle — gbrain shipped its own pack at `openclaw.plugin.json` and that was it. v0.37 opens the door: anyone with a GitHub repo (or a tarball) can publish a skillpack, anyone else can scaffold it into their agent workspace, and `gbrain skillpack doctor` scores any candidate pack against a 10-dimension quality rubric with paste-ready fixes for every failure. The model is **scaffolding, not amber** — v0.36 already retired the install/uninstall semantics; v0.37 extends `scaffold` to third-party sources without re-introducing the managed-block trap.
+
+### What you can now do
+
+**Run `gbrain skillpack scaffold garrytan/skillpack-hackathon-evaluation`** and the pack lands in your workspace — files copied additively, refuses to overwrite anything you've edited, source URL + pinned commit + tarball SHA recorded in `~/.gbrain/skillpack-state.json`. First-time scaffold of a new source surfaces a TOFU confirm prompt showing name + author + source + pinned commit + tier; subsequent scaffolds of the same (name, author, pin) triple skip the prompt. Local-path sources skip the prompt entirely (you already own the directory).
+
+**Run `gbrain skillpack search yc`** and see every registered pack with a `yc` tag. Endorsed tier sorts first, community next, experimental last. `gbrain skillpack info <name>` shows full metadata: author, pinned commit, tarball SHA, validated_at timestamp, skill list, gbrain version requirement.
+
+**Run `gbrain skillpack init my-pack`** in an empty directory and you get a complete 10/10 pack tree out of the box: `skillpack.json` + `skills/<name>/SKILL.md` + `routing-eval.jsonl` (5 example intents) + `runbooks/bootstrap.md` + `CHANGELOG.md` + `README` + `LICENSE` + `.gitignore` + `test/` + `e2e/` + `evals/`. Edit the stubs, run `gbrain skillpack doctor . --quick`, run `gbrain skillpack pack`, get a deterministic `<name>-<version>.tgz` ready to publish.
+
+**Run `gbrain skillpack doctor <pack-dir>`** against any candidate pack and see a 0-10 score with per-dimension pass/fail and paste-ready fix commands. The rubric splits into 5 required core dimensions (manifest valid, skills have SKILL.md, routing-evals present, unique triggers, CHANGELOG current) + 5 quality badges (unit tests, e2e tests, LLM-judge evals, bootstrap runbook, license). Tier eligibility: all 10 = endorsed-eligible, >=3 badges = community, core-only = experimental, any core fails = blocked. `--fix --yes` auto-scaffolds the dimensions flagged `auto_fixable: true`.
+
+**Read `examples/skillpack-reference/`** to see the canonical 10/10 pack. It ships inside the gbrain repo, scores 10/10 forever (regression-pinned), and doubles as both a publisher example and an integration-test fixture. `docs/skillpack-anatomy.md` documents the contract one page, auto-generated from the declarative rubric at `src/core/skillpack/rubric.ts`.
+
+### Itemized changes
+
+#### Third-party scaffold path
+
+- `src/core/skillpack/manifest-v1.ts` — runtime validator for third-party `skillpack.json`. Schema is `gbrain-skillpack-v1`; forward-compat `runbook_schema_version` + `eval_schema_version` knobs. Adapter `bundleManifestFromSkillpack` projects onto the v0.36 `BundleManifest` shape so existing `enumerateScaffoldEntries` + `loadSkillSources` paths consume third-party packs without changes.
+- `src/core/skillpack/remote-source.ts` — `classifySpec` + `resolveSource`. Handles owner/repo → github URL expansion, https git clones (via SSRF-hardened `git-remote.ts`), local tarball extraction, and local directories. Cache layout: `~/.gbrain/skillpack-cache/git/<host>/<owner>/<repo>/<sha>/` and `~/.gbrain/skillpack-cache/tarball/<sha256>/`. Stage-then-rename pattern prevents partial-clone cache poisoning.
+- `src/core/skillpack/tarball.ts` — deterministic pack + allowlist-gated extract. GNU tar flags (`--sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner` + `GZIP=-n` + `TZ=UTC`) so same source dir → same SHA. Extract rejects symlinks / hardlinks / devices / FIFOs; caps at 5000 files, 1MB/file, 100MB total, 255-char paths, 100:1 compression ratio.
+- `src/core/skillpack/state.ts` — machine-owned trust store at `~/.gbrain/skillpack-state.json`. Codex outside-voice G1 fix: pinned commits + tarball SHAs + rename maps live here, NOT in editable markdown comments. Atomic `.tmp + rename` write. `isAlreadyTrusted` encodes the codex G4 author-mismatch defense.
+- `src/core/skillpack/trust-prompt.ts` — TOFU first-install confirm with full identity block. Local-path sources skip the gate; tarball + git sources prompt. Non-TTY without `--trust` refuses with an actionable message.
+- `src/core/skillpack/bootstrap-display.ts` — codex T1 fix: post-scaffold runbook is DISPLAYED, never executed. Frame header makes clear: "gbrain deliberately does NOT auto-execute these steps." The agent reads the framed output and walks per-step at its own discretion.
+- `src/core/skillpack/scaffold-third-party.ts` — orchestrator. Composes manifest validation + gbrain version gate + trust prompt + `enumerateScaffoldEntries` + `copyArtifacts` + state.json upsert + bootstrap display.
+- `src/commands/skillpack.ts` extended — `cmdScaffold` disambiguates: contains `/` / `://` / `.tgz` → third-party; bare kebab → bundled-first, registry-fallback. New flags: `--trust`, `--no-cache`.
+
+#### Registry catalog (read side)
+
+- `src/core/skillpack/registry-schema.ts` — validators for `registry.json` (catalog) and `endorsements.json` (Garry-only tier overlay). Codex G3 separation: contributors PR catalog entries with `default_tier: community/experimental/dead`; only Garry edits the overlay file.
+- `src/core/skillpack/registry-client.ts` — fetch + 1h soft-TTL cache + stale-fallback. On fetch failure: serves the last-good cache with a stderr warning; escalates to "cache is stale, run --refresh" past 7 days. Hard-fails only on first-run-with-no-network.
+- `gbrain skillpack search [<query>] [--tier T]` / `info <name>` / `registry [--url URL] [--refresh]` — read-side CLI surface.
+
+#### Quality bar — rubric + doctor + audit
+
+- `src/core/skillpack/rubric.ts` — declarative `SKILLPACK_RUBRIC_V1` array. Single source of truth for doctor + (auto-generated) anatomy doc + tests. Each dimension exports `{id, name, category, description, auto_fixable, check}` and the check function returns `{passed, detail, fix_hint}` so the doctor surfaces paste-ready remediation for every failure.
+- `src/core/skillpack/doctor.ts` — `runDoctor({mode: 'quick' | 'full', fix, yes})`. `--quick` is the structural sweep (~5s, no sandbox / no LLM / no DB) for tight iteration loops. `--fix` walks `auto_fixable` dimensions and scaffolds missing routing-evals / CHANGELOG / test stubs / LLM-judge stubs / bootstrap runbook / LICENSE.
+- `src/core/skillpack/audit.ts` — `~/.gbrain/audit/skillpack-YYYY-Www.jsonl`. ISO-week rotated; mirrors the slug-fallback + rerank-audit patterns. Best-effort writes (never throws); `gbrain doctor` reads recent events for the future activity surface.
+- `gbrain skillpack doctor <pack-dir> [--quick|--full] [--fix] [--yes] [--json]` — exit codes 0 if score=10, 1 if 6-9, 2 if blocked/<5.
+
+#### Publisher side
+
+- `src/core/skillpack/init-scaffold.ts` — `gbrain skillpack init <name>` cathedral default. Scaffolds the complete 10/10 pack tree; freshly-init'd pack scores 10/10 on `doctor --quick` immediately. `--minimal` flag drops test/e2e/evals for power users opting out.
+- `src/core/skillpack/pack-publish.ts` — `gbrain skillpack pack [<pack-dir>] [--out PATH] [--dry-run] [--skip-doctor]` runs `runDoctor(--quick)`, refuses if blocked, packs deterministic tarball. SHA-256 reported on success; publish-gate skill consumes `--skip-doctor` (gate runs server-side).
+- `src/core/skillpack/endorse.ts` — `gbrain skillpack endorse <name> [--tier T] [--repo PATH] [--push] [--dry-run]` is the Garry-only operator workflow. Validates pack is in the catalog, writes `endorsements.json` with stable key ordering, commits with a one-line message `endorse: <name> -> <tier>`.
+
+#### Reference + anatomy doc
+
+- `examples/skillpack-reference/` — real 10/10 pack tree shipped inside the gbrain repo. SKILL.md body teaches the third-party contract; serves as both a publisher example and an integration-test fixture. Regression-pinned by `test/skillpack-reference-pack-is-ten.test.ts` — any change that drops the reference below 10/10 fails the build.
+- `docs/skillpack-anatomy.md` — auto-generated one-page reference. Tree map + rubric tables + tier eligibility + CLI reference. Generator: `scripts/build-skillpack-anatomy.ts` (`--check` mode for CI freshness gating).
+- `docs/designs/SKILLPACK_REGISTRY_V1_SPEC.md` — full strategic spec preserved as the design record. 27 locked decisions across CEO + Eng + DX (two rounds) + Codex outside-voice.
+
+#### v0.36.1.0 drift fixes (tangential cleanup)
+
+The v0.36.1.0 hindsight calibration wave shipped three new cycle phases (`propose_takes`, `grade_takes`, `calibration_profile`) but two E2E tests had stale assertions:
+
+- `test/e2e/cycle.test.ts` phase count 13 → 16.
+- `test/e2e/dream-cycle-phase-order-pglite.test.ts` `EXPECTED_PHASES` updated + `mock.module` block for `embedding.ts` now declares `embedMultimodal` + `embedQuery` (v0.36.1.0 additions).
+
+These were unrelated to skillpack work; surfaced during the cathedral's E2E sweep and fixed as clean-up commits.
+
+### To take advantage of v0.37.0.0
+
+`gbrain upgrade` runs `gbrain apply-migrations` which is a no-op for this release (no schema migrations). To start publishing skillpacks:
+
+1. **Initialize a new pack**: `gbrain skillpack init my-pack`
+2. **Edit + iterate**: `cd my-pack`, edit `skills/my-pack/SKILL.md` + add real routing intents to `routing-eval.jsonl`
+3. **Verify**: `gbrain skillpack doctor . --quick`
+4. **Pack**: `gbrain skillpack pack` → emits `my-pack-0.1.0.tgz` with deterministic SHA
+5. **Publish**: push the pack repo to GitHub; share `owner/repo` for `gbrain skillpack scaffold owner/repo`
+
+To consume a third-party pack:
+
+1. **Search**: `gbrain skillpack search <query>` (when the registry repo at `garrytan/gbrain-skillpack-registry` ships; until then, scaffold by URL)
+2. **Scaffold**: `gbrain skillpack scaffold owner/repo` or `gbrain skillpack scaffold ./path/to/pack.tgz`
+3. **Inspect**: the agent reads the displayed `bootstrap.md` and walks the steps at its own discretion
+
+If `gbrain skillpack doctor` or `gbrain skillpack scaffold` errors out, please file an issue at https://github.com/garrytan/gbrain/issues with the command you ran, the pack source URL or local path, and output of `gbrain doctor`. This feedback loop is how the gbrain maintainers find rough edges in v1 of the third-party skillpack flow.
+
+### Deferred to follow-up waves
+
+- W4.5 retrofit of bundled gbrain skills to 10/10 (content work; multi-day; `doctor --fix --yes` auto-scaffolds most of it).
+- Subprocess sandbox (bwrap / sandbox-exec) for publish-gate trial install (the publish-gate skill itself remains a follow-up; today the publisher runs `doctor --quick` locally and the validation log is the trust artifact).
+- `garrytan/gbrain-skillpack-registry` GitHub repo setup with the CI workflow split (codex G3).
+- Cross-listing in `mvanhorn/printing-press-library` (external repo PR).
+- Generated `gbrain-cli` via Printing Press for non-gbrain agents to hit a remote gbrain.
 ## [0.36.6.0] - 2026-05-19
 
 **Your photos finally show up when you ask. The brain just got eyes.**
