@@ -2,6 +2,108 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.37.1.0] - 2026-05-19
+
+**Your agent now catches skills that would call the web before checking the brain. The same class of miss that flagged Garry's own Palantir tweet as a risk because none of the three eval models knew he built it.**
+
+Real story: on 2026-05-19, the cross-modal eval looked at a tweet about Palantir's Finance UI and said "this is risky, none of us recognize this work." But Garry's brain already had pages explaining he designed that Finance UI and shipped 150+ PSDs in 2006. The brain knew. The eval skill went to the web first and never asked the brain. A static SKILL.md check catches the authorship side of that failure mode: any skill that calls `web_search`, Perplexity, Exa, Crustdata, Happenstance, or Captain API now has to declare either how it consults the brain first, or that it intentionally doesn't need to.
+
+How to turn it on (it's already on after upgrade):
+
+```
+gbrain doctor                 # warns on skills that need brain-first declaration
+gbrain doctor --fix           # auto-adds the canonical Convention callout to each
+gbrain doctor --fix --dry-run # preview without writing
+```
+
+What a flagged skill looks like in your `~/.openclaw/workspace/skills/`:
+
+| Skill | What the doctor sees | Easy fix |
+|---|---|---|
+| Author called `perplexity` for research but never `gbrain search` | warn — `missing_brain_first` | `gbrain doctor --fix` adds `> **Convention:** see [conventions/brain-first.md](...)` near the top |
+| Pure infra (cron schedulers, container managers, ask-user prompters) | warn — same | Add `brain_first: exempt` to frontmatter; that's it |
+| Author typed `brain-first: exempt` (kebab-case typo) | warn + paste-ready hint | Switch to snake_case `brain_first: exempt` |
+| Already carries `> **Convention:** see conventions/brain-first.md` | ok — `compliant_callout` | no action |
+| First `gbrain search` reference comes before first `web_search` in body | ok — `compliant_position` | no action |
+
+The cathedral piece that makes this stick: `gbrain doctor --fix` runs through the same git-safety gates that `dry-fix.ts` already shipped (refuses to write to a dirty working tree, refuses on non-git files, refuses against the install-tree fallback). So you can run `--fix` on your OpenClaw workspace without losing the audit trail.
+
+Things to watch:
+- Audit log lives at `~/.gbrain/audit/skill-brain-first-YYYY-Www.jsonl` (ISO-week rotated). Stable brains write zero lines per doctor run; only state transitions (new violation, resolved violation, applied fix) get recorded. So `tail -20` actually shows you signal, not noise.
+- The snapshot at `~/.gbrain/audit/skill-brain-first-snapshot.json` is last-writer-wins under concurrent doctor runs. If two doctor processes race, one snapshot wins; the next run reconciles.
+- New skills scaffolded via `gbrain skillify scaffold <name>` get the canonical Convention callout pre-inserted. `gbrain skillify check <skill>` fails (exit 1) when external-lookup-without-callout-or-exempt is detected, so non-compliant skills can't sneak through scaffold-then-merge.
+- This catches the AUTHORSHIP miss class. The RUNTIME analog (intercepting MCP tool dispatch when a subagent calls `web_search` without an earlier `gbrain search` in the same turn) is filed as a v0.37+ TODO. Both layers eventually.
+
+What we caught and fixed before merging:
+- Codex's outside-voice review (gpt-5.5) found 18 issues against an earlier draft. Three of them changed the design materially:
+  1. The original plan shipped a one-shot upgrade migration that would have silently edited host SKILL.md files outside the `--fix` git-safety contract. Codex flagged that as smuggling the PR allowlist back in as data. Dropped the migration; doctor surfaces the hint and `--fix` applies via the existing safety gates.
+  2. The original plan auto-exempted skills with `tools: [search, query, put_page]` + `writes_pages: true`. Codex pointed out this covers up the riskiest class (ingest skills that write pages AND call Perplexity). Dropped the rule entirely; brain-tool ownership doesn't prove brain-first compliance.
+  3. The first-pass detection regex scanned the whole file. Codex pointed out `tools: [web_search]` in YAML frontmatter would be the "first external reference" and false-flag the skill. Detection now strips frontmatter before any position-relative scan.
+
+### Itemized changes
+
+#### Added
+
+- **`brain_first: exempt` frontmatter field** — declarative opt-out for skills that don't need brain-first. The single canonical form (`brain_first: exempt`, snake_case, lowercase, unquoted). Near-misses (`brain-first`, `BrainFirst`, quoted values, unknown values) trigger a paste-ready doctor hint instead of silent failure.
+- **`skill_brain_first` doctor check** — scans every SKILL.md under the configured skills dir, detects external-lookup patterns (web_search / web_fetch / exa / perplexity / happenstance / crustdata / captain_api / firecrawl), confirms compliance via canonical Convention callout / explicit Phase 1 brain heading / position-relative brain reference / `brain_first: exempt` opt-out / absence of external pattern. Surfaces structured `Check.issues[]` for JSON tooling; emits formerly-EXEMPT_SKILLS hints for PR #1206's historical 40-name allowlist.
+- **`gbrain doctor --fix` MISSING_RULE_PATTERNS** — `dry-fix.ts` gains an INSERT pattern type alongside the existing REPLACE patterns. Auto-inserts `> **Convention:** see [conventions/brain-first.md](../conventions/brain-first.md) for the lookup chain (search → query → get_page → external).` at the `after-h1-paragraph` site of any flagged skill. Idempotent (re-runs detect the existing callout and skip).
+- **`gbrain skillify scaffold` pre-insert** — `src/core/skillify/templates.ts` now writes the canonical Convention callout into new SKILL.md scaffolds by default. Zero-friction compliance for new skills.
+- **`gbrain skillify check` required item 12** — brain-first compliance is now a real gate, not informational. Exit 1 when an external-lookup skill lacks both the callout and the `brain_first: exempt` declaration.
+- **Snapshot+diff audit at `~/.gbrain/audit/skill-brain-first-YYYY-Www.jsonl`** — transition-only writes. Stable brains produce 0 audit lines per doctor run. `readRecentBrainFirstEvents(7)` exposes the audit for future trend tooling.
+- **Live OpenClaw dev script** at `scripts/live-brain-first-check.ts` — opt-in (`$OPENCLAW_WORKSPACE`-gated) shape report against the live deployment. Not in CI; run manually during dev / QA / post-`--fix` validation.
+- **CI guard `scripts/check-skill-brain-first.sh`** — JSON-parses `gbrain doctor --json` to gate `bun run verify` on `warn` (doctor's exit code only flags `fail`).
+
+#### Changed
+
+- **`src/core/skill-frontmatter.ts`** — NEW shared content-based frontmatter parser. Replaces `filing-audit.ts`'s private path-based `parseFrontmatter`. Adds `tools?`, `triggers?`, `brain_first?: 'exempt'`, and a typed `brain_first_typo` field that surfaces near-miss declarations.
+- **`src/core/skill-fix-gates.ts`** — NEW shared safety primitives module (working-tree check, code-fence guard, etc.). Both REPLACE and INSERT auto-fix patterns consume from here; `dry-fix.ts` re-exports for back-compat.
+- **`skills/conventions/brain-first.md`** — extended with declarative opt-out documentation. New "Declarative opt-out (v0.36.x)" section covers the strict canonical form, typo behavior, and when the opt-out is unnecessary.
+- **PR #1206 hardcoded `EXEMPT_SKILLS` allowlist** — replaced with structural-signal inference + explicit `brain_first: exempt` opt-out. The 40-name list is preserved as `FORMERLY_HARDCODED_EXEMPT` in `src/core/skill-brain-first.ts` purely for doctor-hint flow (CMT1).
+- **`functional-area-resolver` and `strategic-reading` skills in this repo** — gained `brain_first: exempt` frontmatter. Both name `perplexity` in dispatcher prose (sub-skill cross-references) without actually calling external APIs; the regex tripped on word boundary. Declarative opt-out is the canonical fix for this false-positive class.
+
+#### Tests
+
+- New: `test/skill-brain-first.test.ts` (56 cases — frontmatter parser, analyzer ladder across 9 fixtures, offset helpers, regex shape, audit snapshot+diff, PR #1206 regression absorption).
+- New: `test/fixtures/brain-first-skills/*/SKILL.md` (9 fixtures driving the unit + E2E suites).
+- New: `test/e2e/skill-brain-first.test.ts` (12 cases — shape assertions, `--fix` dry-run/apply cycle, idempotency, audit transition signal).
+- Existing: 170 cases in `test/filing-audit.test.ts`, `test/dry-fix.test.ts`, `test/doctor*.test.ts` pass unchanged (regression-preservation).
+
+#### Removed
+
+- Nothing user-facing. The `parseFrontmatter` function inside `filing-audit.ts` is now a thin wrapper over the new shared parser — internal refactor only.
+
+#### For contributors
+
+- The brain-first regex is intentionally permissive (word-boundary `\bperplexity\b` etc.). False-positives on name mentions in dispatcher prose are expected and answered by the declarative opt-out. Tightening to require API-call shape is a v0.36.x+ TODO.
+- The runtime MCP-dispatch brain-first gate is the bigger follow-up wave. Static-check covers authorship; runtime covers compliance. Filed as v0.37+ TODO.
+- Co-Authored-By: garrytan-agents (PR #1206 contributor) — the EXEMPT_SKILLS list shape, regex set, and tweet-shield incident framing carry forward verbatim.
+
+## To take advantage of v0.37.1.0
+
+`gbrain upgrade` runs `gbrain post-upgrade` which runs `gbrain apply-migrations`.
+This release has no schema migrations — every change is filesystem-only — so the
+upgrade is purely the binary swap.
+
+1. **Verify the new check landed:**
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name == "skill_brain_first")'
+   ```
+2. **If your skills dir flags any violators**, the easiest fix is the auto-fix:
+   ```bash
+   gbrain doctor --fix --dry-run  # preview
+   gbrain doctor --fix            # apply (writes the canonical callout)
+   ```
+   Or for genuine infra skills, add `brain_first: exempt` to the frontmatter manually.
+3. **Your agent reads `skills/conventions/brain-first.md` the next time you interact with it.** The new "Declarative opt-out" section documents the contract; no manual agent prompt update needed.
+4. **If `gbrain doctor` reports unexpected violations or any step fails,** file an issue: https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor --json | jq '.checks[] | select(.name == "skill_brain_first")'`
+   - the SKILL.md of the surprising flag
+   - whether `--fix` cleaned it up
+
+   The brain-first detection is regex-based and will hit false-positives on
+   skills that NAME but don't CALL the external tools. Declarative opt-out
+   (`brain_first: exempt`) is the canonical answer for that class.
+
 ## [0.36.3.0] - 2026-05-18
 
 **Search now routes through any embedding column you've populated, not just OpenAI 1536. Voyage and ZeroEntropy columns become first-class search targets in one config flip.**
