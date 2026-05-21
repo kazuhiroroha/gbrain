@@ -12,8 +12,8 @@
  */
 
 import { mkdirSync, appendFileSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { gbrainPath } from '../config.ts';
+import { dirname, join } from 'node:path';
+import { isoWeekFilename, resolveAuditDir } from '../audit-week-file.ts';
 import { estimateMaxCostUsd, ANTHROPIC_PRICING } from '../anthropic-pricing.ts';
 
 export interface BudgetMeterOpts {
@@ -51,15 +51,7 @@ const _unpricedWarnings = new Set<string>();
 
 function auditFilePath(override?: string): string {
   if (override) return override;
-  // ISO week format: YYYY-Www (2026-W18)
-  const now = new Date();
-  const year = now.getUTCFullYear();
-  // ISO week: Thursday's week. Approximated for filename only.
-  const oneJan = new Date(Date.UTC(year, 0, 1));
-  const diffDays = Math.floor((now.getTime() - oneJan.getTime()) / 86_400_000);
-  const week = Math.ceil((diffDays + oneJan.getUTCDay() + 1) / 7);
-  const weekStr = String(week).padStart(2, '0');
-  return gbrainPath(`audit/dream-budget-${year}-W${weekStr}.jsonl`);
+  return join(resolveAuditDir(), isoWeekFilename('dream-budget'));
 }
 
 function writeLedgerLine(path: string, entry: object): void {
