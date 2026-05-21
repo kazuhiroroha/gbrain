@@ -3830,6 +3830,63 @@ export const MIGRATIONS: Migration[] = [
       `,
     },
   },
+  {
+    version: 82,
+    name: 'mcp_spend_reservations',
+    // v0.38 Slice 2 — D3 + codex P2 — reserve-then-settle budget pattern.
+    //
+    // The pre-v82 spend-tracking flow was: take the call, sum mcp_spend_log,
+    // refuse next call when over cap. Race condition: two concurrent agents
+    // from the same client both pre-flight pass at $2 of $5 cap, both spend,
+    // both bust the cap. This table holds in-flight reservations under
+    // pg_advisory_xact_lock(client_id) so the SUM-then-INSERT is atomic.
+    //
+    // Lifecycle:
+    //   pending  → settled  (call returned; actual_cents recorded)
+    //   pending  → expired  (call crashed; sweeper marks; actual=0)
+    //
+    // The TTL sweeper runs on every reserve (cheap when no expired rows).
+    // Partial index on (status, expires_at) WHERE status='pending' keeps
+    // the sweeper fast even when the settled history grows large.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS mcp_spend_reservations (
+        reservation_id UUID PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        job_id BIGINT NULL REFERENCES minion_jobs(id) ON DELETE SET NULL,
+        estimated_cents NUMERIC(12, 4) NOT NULL,
+        actual_cents NUMERIC(12, 4) NULL,
+        model TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'settled', 'expired')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        settled_at TIMESTAMPTZ NULL,
+        expires_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_mcp_spend_reservations_client_time
+        ON mcp_spend_reservations (client_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_mcp_spend_reservations_pending_expires
+        ON mcp_spend_reservations (status, expires_at)
+        WHERE status = 'pending';
+    `,
+  },
+  {
+    version: 83,
+    name: 'oauth_clients_budget_usd_per_day',
+    // v0.38 Slice 2 — D2 + D3 — per-OAuth-client daily budget cap.
+    //
+    // Pre-v83 the daily cap lived in a per-search-image config key. This
+    // column makes it a first-class property of each OAuth client and lets
+    // `gbrain auth register-client --budget-usd-per-day N` persist the cap
+    // alongside scope. NULL = no cap (current pre-v83 behavior).
+    //
+    // Column-only; metadata-only on Postgres 11+ and PGLite 17.5.
+    idempotent: true,
+    sql: `
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS budget_usd_per_day NUMERIC(10, 2) NULL;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
