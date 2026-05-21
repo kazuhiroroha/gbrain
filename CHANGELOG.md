@@ -56,6 +56,138 @@ The hard problem was the validator (shipped in v0.37.5.0). What's left is alignm
 
 - The auto-fix engine's key-scope decision matters. If a future need shows up to normalize arrays for keys beyond `tags`/`aliases` (e.g. an `authors:` field), extend the regex allow-list explicitly. Don't broaden to `[A-Za-z_][\w-]*` — that would rewrite typed-numeric arrays (`scores: ["1", "2"]`) into string arrays and break downstream typed-claim extraction.
 - Codex outside-voice review on this wave produced 11 findings; 1 dropped a planned layer (put_page auto-normalization, because storage hashes parsed fields not raw bytes), 1 narrowed the allow-list, 5 fixed plan housekeeping. Original PRs #1217 (closed, serializer fix) and #1238 (closed, four-layer defense-in-depth) absorbed into this wave.
+## [0.37.7.0] - 2026-05-21
+
+**Your federated brain stops silently writing to the wrong source. Your autopilot stops thrashing when you point it at a second brain. A handful of CLI surfaces that crashed on first call stop crashing.**
+
+If you've ever run gbrain with more than one source (an Obsidian vault + a docs repo, a CEO with multiple team sub-brains), you've probably noticed that `gbrain import --source dept-x` silently writes to `default` instead. Or that `gbrain extract` produces zero links on a federated brain. Or that `gbrain doctor` recommends a command that can't actually fix it. This release wires every CLI surface through the same source-resolver that `gbrain serve` has used since v0.18.0, and adds a doctor check that catches the silent-collapse-to-default class.
+
+Plus: autopilot lockfile finally respects `GBRAIN_HOME` so two brains can coexist. The reconnect loop that logged `config.database_url undefined` forever now exits cleanly and lets launchd back off. `gbrain reindex-frontmatter` no longer crashes before doing anything. OAuth `authorization_code` confidential clients work again. And we caught a dead-letter bug where successful subagent jobs were being marked failed because the worker tried to re-prompt past an `end_turn`.
+
+### What landed
+
+| Piece | What it fixes / adds | How to use it |
+|---|---|---|
+| **`gbrain import --source-id <id>`** (#1167) | `import` finally honors the source flag — pages route to the named source instead of silently collapsing to `default` | `gbrain import path/ --source-id dept-x` |
+| **`gbrain extract --source-id <id>`** (#1204) | Same fix for extract — link + timeline extraction now scopes to one source on federated brains | `gbrain extract all --source-id dept-x` |
+| **`gbrain sources current`** (#1222) | New subcommand that prints the resolved source + the tier that won (flag / env / dotfile / local_path / brain_default / seed_default) | `gbrain sources current --json` |
+| **`gbrain graph-query --include-foreign`** (#1153) | Cross-source edges no longer disappear silently. Footer shows foreign-edge count by default; `--include-foreign` walks them | `gbrain graph-query alice --depth 2 --include-foreign` |
+| **`skills/conventions/brain-routing.md`** (#1222) | Documents the canonical 6-tier source resolution chain so agents stop guessing | Read it; pointed at from CLAUDE.md |
+| **Autopilot lockfile scoped to `GBRAIN_HOME`** (#1226) | Two brains can run autopilot simultaneously without one stealing the other's lock | Set `GBRAIN_HOME=/path/to/brain-b gbrain autopilot --install` |
+| **Autopilot reconnect classifier + launchd ThrottleInterval** (#1162) | Reconnect loop that logged `config.database_url undefined` every 5s now exits cleanly. New launchd plist sets `ThrottleInterval=300` so launchd respects unrecoverable failures | `gbrain autopilot --install` regenerates the plist |
+| **OAuth confidential `authorization_code` clients** (#1166) | The MCP SDK's `clientAuth` middleware does plaintext compare; gbrain stores SHA-256 hashes, so confidential clients failed every `/token` request. Custom verifier middleware now runs before the SDK | `gbrain auth register-client --grant-types authorization_code` works again |
+| **`gbrain reindex-frontmatter`** (#1225) | Crashed on first call because it queried the engine before connecting it. Now connects via the existing command pattern | `gbrain reindex-frontmatter` |
+| **Subagent terminal-on-resume** (#1151) | Successful subagent jobs were being marked failed because the worker tried to re-prompt past an `end_turn` on resume. Short-circuits to terminal | Automatic on next worker restart |
+| **Sync walker skips git submodules** (#1169) | `pruneDir()` now detects submodules (`.git` as a file, not a directory) and stops walking into them. Stops phantom imports of submodule content | Automatic |
+| **3 new doctor checks** (T12/T13/T14) | `source_routing_health` (catches silent-collapse-to-default on federated brains), `oauth_confidential_health` (probes confidential-client `/token` reachability), `autopilot_lock_scope` (warns when lock isn't under `GBRAIN_HOME`) | `gbrain doctor` |
+
+### How to verify the source-routing fix
+
+```bash
+# Show which source resolved + why
+gbrain sources current
+
+# JSON shape for scripting
+gbrain sources current --json
+# → {"source_id":"dept-x","tier":"dotfile","detail":".gbrain-source"}
+
+# Doctor check — should be ok on a properly federated brain
+gbrain doctor --json | jq '.checks[] | select(.name=="source_routing_health")'
+```
+
+The 6-tier chain documented in `skills/conventions/brain-routing.md`:
+
+1. `--source <id>` flag (explicit, always wins)
+2. `GBRAIN_SOURCE` env var
+3. `.gbrain-source` dotfile walk-up
+4. Registered source whose `local_path` contains CWD
+5. Brain default (config key)
+6. Seed default (`default`)
+
+### What's safe to know about
+
+- **Default behavior unchanged for single-source brains.** If you only have `default`, nothing in this release changes how your commands route. The fixes only fire on federated brains (`gbrain sources list` shows more than one row).
+- **Autopilot lockfile path changed.** Old: `~/.gbrain/autopilot.lock` only. New: `$GBRAIN_HOME/autopilot.lock` (defaults to `~/.gbrain` when unset, so most users see no path change). The doctor check warns if your `GBRAIN_HOME` is set but the lock landed in the wrong place.
+- **`reindex-frontmatter`'s fix is two lines but it's load-bearing.** Pre-fix the command would `process.exit(1)` with a TypeError on first call. Post-fix it does what it always claimed to.
+- **OAuth confidential clients were dead in v0.37.0–v0.37.6.** If your agent (Hermes, custom orchestrator) uses `authorization_code` + `client_secret_post` against gbrain, you needed this. Public PKCE clients (Claude Code, Cursor) were unaffected — they don't present a secret.
+- **The 3 new doctor checks are warn-only.** None fail the doctor exit. They surface paste-ready fix hints inline.
+
+### What we caught and fixed before merging
+
+- **Lockfile PID-safety.** The first-pass autopilot-lock fix moved the lock path but kept the existence-only check. Codex caught that a stale lock from a crashed process would block a healthy autopilot from starting. The shipped version writes PID into the lock and checks `kill -0 <pid>` before refusing to start.
+- **OAuth confidential auth detection.** The first-pass middleware sniffed for `Authorization: Basic` headers only. That missed `client_secret_post` (form-encoded body) which is the more common shape. The shipped version handles both.
+- **`pruneDir` submodule detection.** The first-pass used `existsSync(.git)` which is true for both regular repos AND submodules. Refined to `statSync(.git).isFile()` — submodule gitfiles are FILES pointing into the parent's `.git/modules/`, regular repos have `.git` as a DIRECTORY.
+- **`resolveSourceWithTier()` is additive.** Original plan refactored `resolveSourceId()` to return the tier. Codex pointed out that breaks every existing caller. Shipped as a new function alongside the old one; the existing 6-tier chain is unchanged.
+
+### Itemized changes
+
+#### CLI surfaces (production code)
+
+- `src/commands/import.ts` — new `--source-id <id>` flag. Resolved via `resolveSourceWithTier()` before any page write; failures surface with paste-ready `gbrain sources list` hint. Closes #1167.
+- `src/commands/extract.ts` — same `--source-id` flag, threaded through `extractLinks()` / `extractTimeline()` so SQL scopes to the named source. Closes #1204.
+- `src/commands/sources.ts` — new `gbrain sources current [--json]` subcommand. Calls `resolveSourceWithTier()` and prints `source_id`, `tier`, optional `detail`. Closes #1222.
+- `src/commands/graph-query.ts` — foreign-edge footer always present (`X foreign edges (use --include-foreign to traverse)`). `--include-foreign` flag widens the SQL filter to cross-source edges. Closes #1153.
+- `src/commands/reindex-frontmatter.ts` — wrapped query path in the standard `withEngine(...)` lifecycle so `engine.connect()` runs before the first SQL call. Closes #1225.
+- `src/commands/autopilot.ts` — `LOCK_PATH` now resolves via `gbrainPath('autopilot.lock')` (honors `GBRAIN_HOME`). New exports `classifyReconnectError(err)` (returns `'recoverable' | 'unrecoverable'`; unrecoverable causes the daemon to `process.exit(0)` and let launchd back off) and `generateLaunchdPlist(wrapperPath, home)` (pure plist string for tests). Lock file now stores PID; startup checks `kill -0 <pid>` before refusing. Closes #1162 + #1226.
+- `src/core/oauth-provider.ts` + `src/commands/serve-http.ts` — custom `/token` middleware that runs BEFORE the MCP SDK's `clientAuth`. Detects confidential auth via `Authorization: Basic` header OR `client_secret_post` form body; verifies via SHA-256 hash compare and falls through to the SDK for public PKCE clients. Closes #1166.
+- `src/core/sync.ts` — `pruneDir(name, parentDir?)` extended with optional `parentDir`; when provided, additionally rejects directories containing `.git` as a FILE (git submodule gitfile pattern). Sync + extract walkers thread `parentDir` through. Closes #1169.
+- `src/core/minions/handlers/subagent.ts` — terminal-state short-circuit on resume. When a stored message thread already ends in `stop_reason: 'end_turn'`, the handler returns `{ ok: true }` instead of issuing another `messages.create` call (which would have failed and dead-lettered a successful job). Closes #1151.
+
+#### New helpers (production code)
+
+- `src/core/source-resolver.ts` — additive `resolveSourceWithTier(engine, explicit, cwd)` returns `{ source_id, tier, detail? }`. New exported const `SOURCE_TIER_NAMES = ['flag', 'env', 'dotfile', 'local_path', 'brain_default', 'seed_default']` so the JSON shape is type-stable across releases. The existing `resolveSourceId()` is unchanged.
+
+#### Doctor checks (production code)
+
+- `src/commands/doctor.ts` — three new checks wired into both `runDoctor()` and the JSON envelope:
+  - `checkSourceRoutingHealth(engine)` — scans up to 200 pages on federated brains, flags pages whose `source_id` doesn't match what `resolveSourceWithTier()` would have picked for their `source_path`. Short-circuits to `ok` for single-source brains.
+  - `checkOauthConfidentialHealth(engine)` — probes registered confidential clients for `/token` reachability; warns when the v0.37.0–v0.37.6 plaintext-compare bug class would have rejected them.
+  - `checkAutopilotLockScope()` — pure function check (no engine). Compares the resolved lock path to `$GBRAIN_HOME`; warns when `$GBRAIN_HOME` is set but the lock lives elsewhere, with a PID-safe hint to inspect the lock file before deleting it.
+
+#### Documentation
+
+- `skills/conventions/brain-routing.md` — new convention skill documenting the 6-tier source resolution chain with paste-ready agent decision table. Linked from CLAUDE.md's "Two organizational axes" section. Closes #1222.
+
+#### Tests
+
+- `test/source-resolver-with-tier.test.ts` — 6-tier resolution chain coverage (each tier's win condition, precedence ordering, invalid-source rejection, detail strings). Uses `withEnv()` wrapper for env-mutation isolation per the test-isolation lint.
+- `test/import-source-id.test.ts` — `--source-id` flag round-trip + error path.
+- `test/graph-query.test.ts` — foreign-edge footer + `--include-foreign` traversal.
+- `test/oauth-confidential-client.test.ts` — `client_secret_basic` + `client_secret_post` paths against the custom middleware.
+- `test/autopilot-lock-path.test.ts` — `GBRAIN_HOME` scope + PID-safe staleness detection.
+- `test/autopilot-reconnect-classifier.test.ts` — recoverable vs unrecoverable error classification + plist generator shape.
+- `test/sync-walker-submodule.test.ts` — submodule detection via gitfile-as-FILE.
+- `test/subagent-handler.test.ts` — terminal-on-resume short-circuit.
+- `test/reindex-frontmatter-connect.test.ts` — engine.connect() runs before first query.
+- `test/doctor-v0_37_7_checks.test.ts` — all 3 new doctor checks against fixture brains (single-source ok-fast-path, federated brain mismatch warn, OAuth confidential warn shape, lock-scope mismatch warn).
+
+#### Closed community PRs
+
+Credited contributors per the CHANGELOG attribution convention; closing comments point at the absorbed commits.
+
+## To take advantage of v0.37.7.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if
+`gbrain doctor` warns about anything new:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the source-routing fix on your federated brains:**
+   ```bash
+   gbrain sources current
+   gbrain doctor --json | jq '.checks[] | select(.name=="source_routing_health")'
+   ```
+3. **If autopilot was thrashing on a second-brain install,** check
+   the new lockfile path:
+   ```bash
+   ls -la ~/.gbrain/autopilot.lock $GBRAIN_HOME/autopilot.lock 2>/dev/null
+   ```
+4. **If any step fails,** file an issue at
+   https://github.com/garrytan/gbrain/issues with `gbrain doctor`
+   output + contents of `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
 ## [0.37.6.0] - 2026-05-20
 
 **One key, many hosted models.**
