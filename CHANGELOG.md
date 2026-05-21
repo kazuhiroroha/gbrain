@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [Unreleased] — brainstorm cost cathedral
+## [0.39.0.0] - 2026-05-21
 
 **You can finally cap the cost of `gbrain brainstorm` and `gbrain lsd`, AND if the cap fires mid-run, you can resume right where you left off without losing the ideas you already paid for.**
 
@@ -56,8 +56,39 @@ If you wrote integration code against `BudgetExhausted` in the brainstorm orches
 
 ### For contributors
 
-- `bun test` adds 73 new tests across 9 new files (`test/core/budget/`, `test/core/audit-week-file.test.ts`, `test/core/diarize/`, `test/brainstorm/checkpoint.test.ts`, `test/e2e/brainstorm-resume.test.ts`, `test/core/remediation-checkpoint.test.ts`). All previous brainstorm + doctor + eval-contradictions tests still pass.
-- The `test/e2e/brainstorm-resume.test.ts` works around a pre-existing PGLite schema gap (the brainstorm domain-bank queries `page_links` but the embedded schema only defines `links`) by creating a view inside the test setup. Filed as a follow-up in `TODOS.md` — the canonical schema needs the view materialized so `gbrain brainstorm` works against PGLite brains in production.
+- `bun test` adds 73 new tests across 9 new files (`test/core/budget/`, `test/core/audit-week-file.test.ts`, `test/core/diarize/`, `test/brainstorm/checkpoint.test.ts`, `test/e2e/brainstorm-resume.test.ts`, `test/core/remediation-checkpoint.test.ts`). Plus F1 closes the pre-existing PGLite `page_links` schema gap (the brainstorm domain-bank queries `page_links` but the embedded schema only defined `links`). Brainstorm now works against PGLite brains in production via the new `page_links` view alias shipped in both the embedded schema bundle and migration v81. F2 adds an E2E pinning the user-facing `--max-cost` pre-flight refusal path. F3 adds `--max-cost` to `gbrain reindex --code`. All previous brainstorm + doctor + eval-contradictions tests still pass.
+
+## To take advantage of v0.39.0.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+   This applies migration v81 (`page_links_view_alias`) on PGLite + Postgres brains. The alias is required for `gbrain brainstorm` and `gbrain lsd` to work against the domain-bank tiebreaker; without it, the brainstorm domain-bank queries fail with `relation "page_links" does not exist`.
+2. **Set a cost cap on the commands you care about:**
+   ```bash
+   # Sets a per-run dollar ceiling. Throws BudgetExhausted before any LLM call
+   # if the pre-run estimate exceeds the cap, AND mid-run if cumulative spend
+   # blows past it.
+   gbrain brainstorm "test" --max-cost 1
+   gbrain doctor --remediate --max-cost 5
+   gbrain reindex --code --max-cost 10
+   ```
+3. **Verify the outcome:**
+   ```bash
+   gbrain doctor             # schema_version should be 81
+   gbrain brainstorm --list-runs   # confirms the new checkpoint directory exists
+   ```
+4. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+   This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
 
 ## [0.37.9.0] - 2026-05-20
 
