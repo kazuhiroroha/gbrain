@@ -116,6 +116,7 @@ voice, OCR) against the versioned `IngestionSource` contract at
 
 ## Recent releases
 
+- **v0.40.6.0** — `gbrain sync --all` runs every configured source in parallel under a per-source lock invariant. `gbrain sources status` is the new at-a-glance dashboard. Live console prefix shows which source is talking when 6 jobs are running at once.
 - **v0.40.4.0** — per-query graph signals in hybrid search; adjacency, cross-source, and session-demote boosts. `gbrain search --explain` shows per-stage attribution.
 - **v0.40.2.0** — `gbrain think` grounds temporal answers in the typed-claim timeline. Ask "when did Marco last switch jobs" or "what was the ARR in March" and the answer is rooted in real chronology. Default on; flip `think.trajectory_enabled=false` to opt out.
 - **v0.36.4.0** — `gbrain doctor --remediate --yes --target-score 90 --max-usd 5` drives the brain to 90/100 unattended. Cron-safe. Eleven new background-job types; three protected so an MCP-connected agent can't silently burn credits.
