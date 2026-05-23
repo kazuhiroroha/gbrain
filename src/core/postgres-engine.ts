@@ -424,7 +424,17 @@ export class PostgresEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'source_uri') AS pages_source_uri_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'source_kind') AS pages_source_kind_exists
+                WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'source_kind') AS pages_source_kind_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'contextual_retrieval_mode') AS pages_cr_mode_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'corpus_generation') AS pages_corpus_generation_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'sources' AND column_name = 'contextual_retrieval_mode') AS sources_cr_mode_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'sources' AND column_name = 'trust_frontmatter_overrides') AS sources_trust_fm_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'generation') AS pages_generation_exists
     `;
     const probe = probeRows[0]!;
 
@@ -491,6 +501,24 @@ export class PostgresEngine implements BrainEngine {
           || !probeProv.pages_ingested_at_exists
           || !probeProv.pages_source_uri_exists
           || !probeProv.pages_source_kind_exists);
+    // v0.40.5.0 (v90, renumbered from v0.40.3.0 v81 on master merge):
+    // contextual retrieval columns on pages + sources. Defense-in-depth.
+    const probeCr = probe as {
+      pages_cr_mode_exists?: boolean;
+      pages_corpus_generation_exists?: boolean;
+      sources_cr_mode_exists?: boolean;
+      sources_trust_fm_exists?: boolean;
+      pages_generation_exists?: boolean;
+    };
+    const needsContextualRetrievalColumns = (probe.pages_exists
+        && (!probeCr.pages_cr_mode_exists || !probeCr.pages_corpus_generation_exists))
+      || (probe.sources_exists
+          && (!probeCr.sources_cr_mode_exists || !probeCr.sources_trust_fm_exists));
+    // v0.40.5.0 (v91): pages.generation BIGINT bumped by
+    // bump_page_generation_trg. pages_generation_idx in SCHEMA_SQL references
+    // it. Pre-v91 brains crash without the column; bootstrap adds it before
+    // SCHEMA_SQL replay creates the index.
+    const needsPagesGeneration = probe.pages_exists && !probeCr.pages_generation_exists;
 
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsMcpLogBootstrap && !needsSubagentProviderId
@@ -498,7 +526,8 @@ export class PostgresEngine implements BrainEngine {
         && !needsIngestLogSourceId && !needsFilesBootstrap
         && !needsOauthClientsBootstrap && !needsSourcesArchive
         && !needsPagesLastRetrievedAt
-        && !needsPagesProvenance) return;
+        && !needsPagesProvenance
+        && !needsContextualRetrievalColumns && !needsPagesGeneration) return;
 
     console.log('  Pre-v0.21 brain detected, applying forward-reference bootstrap');
 
@@ -698,6 +727,30 @@ export class PostgresEngine implements BrainEngine {
         ALTER TABLE pages ADD COLUMN IF NOT EXISTS ingested_at TIMESTAMPTZ;
         ALTER TABLE pages ADD COLUMN IF NOT EXISTS source_uri TEXT;
         ALTER TABLE pages ADD COLUMN IF NOT EXISTS source_kind TEXT;
+      `);
+    }
+
+    if (needsContextualRetrievalColumns) {
+      // v0.40.5.0 v90 (contextual_retrieval_columns, renumbered from
+      // v0.40.3.0 v81 on master merge). Five additive columns wiring the
+      // three-tier wrapper ladder. Defense-in-depth probes; v90 runs later
+      // via runMigrations and is idempotent (ADD COLUMN IF NOT EXISTS).
+      await conn.unsafe(`
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS contextual_retrieval_mode TEXT;
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS corpus_generation TEXT;
+        ALTER TABLE sources ADD COLUMN IF NOT EXISTS contextual_retrieval_mode TEXT;
+        ALTER TABLE sources ADD COLUMN IF NOT EXISTS trust_frontmatter_overrides BOOLEAN NOT NULL DEFAULT FALSE;
+      `);
+    }
+
+    if (needsPagesGeneration) {
+      // v0.40.5.0 v91 (pages_generation_trigger_and_bookmark):
+      // pages.generation BIGINT. SCHEMA_SQL CREATE INDEX
+      // pages_generation_idx ON pages (generation) crashes on pre-v91 brains
+      // without this. The trigger and index land via v91 migration run
+      // later; bootstrap only adds the column. v91 is idempotent.
+      await conn.unsafe(`
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1;
       `);
     }
   }
