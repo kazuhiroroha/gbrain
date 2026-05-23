@@ -157,6 +157,220 @@ Content-Type: application/json
 - Filed v0.39+ TODOs: SQL-shape rewrite of `listPrefixSampledPages` for PgBouncer; magic-byte allowlist for binary content detection; `--source-kind` override flag; facts:absorb root-cause trace; ingest_capture Minion handler architecture migration.
 
 
+## [0.39.2.0] - 2026-05-22
+
+**Your federated brain refreshes all its sources in parallel now, not one at a time.**
+
+If you have a brain with multiple sources — say `personal`, `portfolio`, and
+`yc` — autopilot used to refresh one of them per tick. Five-minute ticks, five
+sources, worst case ~25 minutes for the last source to catch up. After this
+wave, autopilot fans out one cycle job per stale source per tick, and your
+workers process them in parallel. Same five-source brain refreshes in roughly
+one tick of wall-clock.
+
+The lock infrastructure underneath also got cleaner. Pre-v0.39 the cycle held
+ONE global row in `gbrain_cycle_locks` keyed `'gbrain-cycle'` — so two
+`gbrain dream --source X` and `--source Y` runs in different terminals
+blocked each other. After: each source gets its own lock row
+(`gbrain-cycle:<source_id>`), so they run concurrently on Postgres.
+PGLite still serializes through a single file lock because the underlying
+storage is single-writer; that's preserved as belt-and-braces.
+
+### How it works
+
+| Surface | What it does |
+|---|---|
+| `engine.listAllSources()` | New lean per-source enumeration. `localPathOnly:true` filters pure-DB sources so fan-out doesn't dispatch jobs that would fall back to the global `sync.repo_path`. |
+| `cycleLockIdFor(sourceId)` | Per-source lock primitive. `undefined` returns legacy `'gbrain-cycle'` (back-compat for autopilot's no-source path); set returns `'gbrain-cycle:<id>'`. Defense-in-depth validation via `assertValidSourceId`. |
+| `CycleOpts.sourceId` | First-class field on the cycle entry point. `runCycle({sourceId})` writes `last_full_cycle_at` to `sources.config` JSONB on success. |
+| `dispatchPerSource` | Per-tick fan-out helper. Enumerates sources, computes per-source freshness from `last_full_cycle_at`, submits up to `fanoutMax` jobs (default 4 Postgres, 1 PGLite). Per-source idempotency keys (`autopilot-cycle:<id>:<slot>`) dedup within a slot; different sources never collide. |
+| `autopilot-cycle` handler | Threads `source_id` + `pull` from job data. Archive recheck happens at handler entry (before lock acquisition) so a source archived between fan-out and worker claim returns `{status: 'skipped'}` cleanly. |
+| `cycle_freshness` doctor check | Sibling to `sync_freshness`. Reads what autopilot sees: per-source `last_full_cycle_at` with 6h warn / 24h fail. `gbrain dream --source <id>` is the fix hint. |
+| `cycle_phase_scope` doctor check | Informational. Renders the static taxonomy: which phases are `source`-scoped vs `global` vs `mixed`. Documents what future fan-out waves can safely parallelize. |
+| Tunable `autopilot.fanout_max_per_tick` | Operator override for the per-tick cap. PGLite enforces 1 regardless (single-writer). |
+
+### What you'll see
+
+```
+$ gbrain autopilot --json
+[dispatch] fanout: 3 dispatched, 1 fresh, 0 capped (score=92, max=4)
+{"event":"dispatched","job_id":42,"mode":"per_source","source_id":"personal","pull":false,"slot":"2026-05-22T15:00:00.000Z"}
+{"event":"dispatched","job_id":43,"mode":"per_source","source_id":"portfolio","pull":true,"slot":"2026-05-22T15:00:00.000Z"}
+{"event":"dispatched","job_id":44,"mode":"per_source","source_id":"yc","pull":true,"slot":"2026-05-22T15:00:00.000Z"}
+{"event":"fanout_summary","dispatched":["personal","portfolio","yc"],"skipped_fresh":["scratch"],"fanout_max":4}
+```
+
+Single-source brains see zero change. The fan-out path falls back to the
+legacy single-job dispatch when `sources` has no rows with `local_path`
+set, so fresh `gbrain init` installs keep working exactly as before.
+
+### Things to know
+
+- **`validateSourceId` tightened.** The path-safety regex went from
+  permissive `^[a-z0-9_-]+$` to strict kebab `^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$`
+  (matches what `sources-ops` always enforced at creation time). Underscored
+  source IDs were never accepted at creation, so no existing IDs break, but
+  the new regex is now the canonical contract everywhere. If you somehow
+  have underscored IDs in production, run `gbrain sources list` and rename
+  before upgrading.
+- **CycleOpts.sourceId is new.** Existing callers (autopilot's legacy
+  path, `gbrain dream` without `--source`) skip the per-source `last_full_cycle_at`
+  write so back-compat is byte-perfect. New CLI invocations and the fan-out
+  path opt in.
+- **Phase-scope honesty.** Per-source LOCKS let two cycles RUN concurrently,
+  but several phases inside each cycle (`embed`, `orphans`, `purge`,
+  `resolve_symbol_edges`, `grade_takes`, `calibration_profile`) still walk
+  the brain globally. The new `cycle_phase_scope` doctor check documents
+  this exhaustively. Genuine per-phase isolation is a follow-up wave; this
+  one ships the foundation cleanly.
+
+### Itemized changes
+
+#### Per-source parallelism
+
+- `src/core/source-id.ts` (NEW, dependency-free): canonical `SOURCE_ID_RE`
+  + `isValidSourceId(s)` boolean + `assertValidSourceId(s)` throw. Single
+  source of truth for the three regex sites that drifted pre-v0.39.
+- `src/core/utils.ts:validateSourceId` re-exports `assertValidSourceId`
+  for back-compat (regex tightens).
+- `src/core/sources-ops.ts` + `src/core/source-resolver.ts` migrate to
+  `source-id.ts`. Resolver tiers 3 + 5 (dotfile, brain_default) use
+  `isValidSourceId` for silent fallback; tiers 1 + 2 (explicit, env) throw.
+- `src/core/cycle.ts`: `acquirePostgresLock` + `acquirePGLiteLock` deleted
+  (~75 LOC of duplicated UPSERT SQL); replaced with `tryAcquireDbLock`
+  from `db-lock.ts`. `cycleLockIdFor(sourceId?)` primitive. `CycleOpts.sourceId`
+  first-class. PGLite file lock acquired BEFORE per-source DB lock with
+  release-both-on-failure cleanup.
+- `src/core/cycle.ts`: `PHASE_SCOPE` taxonomy alongside `ALL_PHASES`.
+  Sixteen phases classified `source` / `global` / `mixed`.
+- `src/core/cycle.ts`: exit hook writes `last_full_cycle_at` to
+  `sources.config` JSONB when `opts.sourceId` is set and status is
+  `ok`/`clean`/`partial`. Best-effort; failure logs warning, doesn't
+  affect cycle status.
+
+#### Engine API
+
+- `src/core/engine.ts`: new `SourceRow` type + `listAllSources(opts?)` +
+  `updateSourceConfig(sourceId, patch)`. Both implemented on Postgres
+  + PGLite. Atomic JSONB merge via `config || $patch::jsonb` (Postgres `||`
+  concat operator); idempotent on re-run.
+
+#### Autopilot
+
+- `src/commands/autopilot-fanout.ts` (NEW): `resolveFanoutMax` (PGLite=1,
+  Postgres=4), `readLastFullCycleAt`, `isSourceStale`,
+  `selectSourcesForDispatch` (stale-only, oldest-first, alphabetical
+  tiebreaker), `dispatchPerSource` (the orchestrator).
+- `src/commands/autopilot.ts:401-503`: existing `shouldFullCycle` branch
+  now calls `dispatchPerSource` instead of submitting one job per tick.
+  Per-source idempotency keys, per-source `pull` flag based on
+  `source.config.remote_url`, NO `maxWaiting` (would silently coalesce
+  per-name+queue — the E2E-found bug).
+- `src/commands/jobs.ts:1146` autopilot-cycle handler: validates
+  `job.data.source_id` via `isValidSourceId` at entry; archive recheck
+  via `SELECT archived FROM sources WHERE id = $1` before runCycle; honors
+  `job.data.pull` (overrides legacy hardcoded `true`); back-compat preserved
+  when `source_id` is omitted.
+
+#### Doctor
+
+- `src/commands/doctor.ts`: new `checkCycleFreshness` (per-source
+  `last_full_cycle_at` with 6h/24h thresholds). Reads what autopilot
+  actually sees.
+- `src/commands/doctor.ts`: new `checkCyclePhaseScope` (informational;
+  renders the taxonomy as both human message and `details.phase_scope_map`
+  for JSON consumers).
+- `Check.details?` field added (mirrors `PhaseResult.details`).
+
+#### Tests (149 new cases across 13 new test files)
+
+- `test/source-id.test.ts` (19 cases) — exhaustive regex coverage
+- `test/regression-strict-source-id.test.ts` (9 cases) — blast-radius
+  pin (patterns.ts + synthesize.ts reverse-write callers)
+- `test/source-resolver-silent-fallback.test.ts` (12 cases) — codex P1-F
+  per-tier validation contract
+- `test/cycle-lock-per-source.test.ts` (13 cases) — `cycleLockIdFor`
+  primitive + per-source isolation
+- `test/cycle-pglite-lock-ordering.test.ts` (6 cases) — PGLite file+DB
+  ordering + release-both-on-failure (codex P0-C/P0-D regression)
+- `test/cycle-last-full-cycle-at.test.ts` (5 cases) — exit hook write
+  semantics + dry-run/legacy/skipped gates
+- `test/phase-scope-coverage.test.ts` (6 cases) — PHASE_SCOPE↔ALL_PHASES
+  coverage + scope value validation
+- `test/list-all-sources.test.ts` (11 cases) — PGLite parity for
+  listAllSources + updateSourceConfig
+- `test/autopilot-fanout.test.ts` (28 cases) — fan-out helper:
+  freshness gate, cap, idempotency, oldest-first, per-source error
+  isolation, regression guard against re-adding `maxWaiting`
+- `test/autopilot-cycle-handler.test.ts` (7 cases) — handler
+  source_id/archive/pull semantics
+- `test/autopilot-fanout-wiring.test.ts` (5 cases) — static-shape
+  regression for autopilot.ts ↔ dispatchPerSource wiring
+- `test/doctor-cycle-freshness.test.ts` (9 cases) — freshness check
+  thresholds + edge cases
+- `test/doctor-cycle-phase-scope.test.ts` (5 cases) — phase taxonomy
+  doctor check
+- `test/e2e/list-all-sources-postgres.test.ts` (11 cases) — Postgres
+  parity for engine methods + JSONB shape regression
+- `test/e2e/autopilot-fanout-postgres.test.ts` (6 cases) — end-to-end:
+  3-source fan-out producing 3 distinct minion_jobs rows with per-source
+  idempotency keys, cap behavior, freshness gate, legacy fallback
+- `test/e2e/multi-source-bug-class.test.ts` updated: 3 new cases pinning
+  the strict-regex contract shift (codex P1-D follow-through)
+
+#### Bug fix found by E2E
+
+The Postgres E2E surfaced that `maxWaiting: 1` on per-source `queue.add`
+calls was silently coalescing all N per-source jobs (sharing
+`name='autopilot-cycle'`) into ONE waiting row. Net effect: fan-out
+would only process the first source per tick, regardless of how many
+were stale. Fixed in c7ed9b99; regression-guard unit test pins that
+`maxWaiting` never reappears in the per-source submit opts.
+
+### Upgrade
+
+`gbrain upgrade` handles this — no manual migration. Run
+`gbrain doctor` after to see `cycle_phase_scope` + `cycle_freshness`
+in your check output. Federated-brain operators will see new
+`fanout_summary` events in the autopilot stream and can tune
+`autopilot.fanout_max_per_tick` if desired.
+
+## To take advantage of v0.39.2.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if
+`gbrain doctor` warns about anything:
+
+1. **Verify the new doctor checks render:**
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name | test("cycle_freshness|cycle_phase_scope"))'
+   ```
+   Both checks should appear with status `ok`. `cycle_phase_scope` is
+   informational and always `ok`. `cycle_freshness` is `ok` on
+   single-source brains (no federated sources to gate); on federated
+   brains it'll reflect the actual per-source freshness state.
+
+2. **If you have a federated brain, watch the autopilot stream:**
+   ```bash
+   gbrain autopilot --json 2>&1 | grep -E "fanout|dispatched"
+   ```
+   You should see `mode: per_source` events with distinct `source_id`
+   values, plus a `fanout_summary` per tick.
+
+3. **Optional: tune the cap:**
+   ```bash
+   # Default is 4 on Postgres, 1 on PGLite. Bump if you have 8+ sources
+   # AND >= 4 workers AND GBRAIN_POOL_SIZE >= 10.
+   gbrain config set autopilot.fanout_max_per_tick 8
+   ```
+
+4. **If any step fails or the numbers look wrong,** please file an
+   issue at https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor --json`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+
+   This feedback loop is how the gbrain maintainers find fragile
+   upgrade paths.
+
 ## [0.39.0.0] - 2026-05-21
 
 **You can finally cap the cost of `gbrain brainstorm` and `gbrain lsd`, AND if the cap fires mid-run, you can resume right where you left off without losing the ideas you already paid for.**
