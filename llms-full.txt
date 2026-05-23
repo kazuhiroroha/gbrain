@@ -4628,6 +4628,8 @@ built-in server is the recommended path.
 
 ---
 
+# AI providers
+
 # Debugging
 
 ## docs/GBRAIN_VERIFY.md
