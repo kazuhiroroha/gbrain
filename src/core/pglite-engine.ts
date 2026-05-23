@@ -2385,6 +2385,49 @@ export class PGLiteEngine implements BrainEngine {
     return result;
   }
 
+  async getAdjacencyBoosts(pageIds: number[]): Promise<Map<number, import('./types.ts').AdjacencyRow>> {
+    const result = new Map<number, import('./types.ts').AdjacencyRow>();
+    if (pageIds.length === 0) return result;
+
+    // PGLite parity with PostgresEngine.getAdjacencyBoosts. SQL contract
+    // and source-scope rationale: see BrainEngine.getAdjacencyBoosts JSDoc.
+    // Same CTE shape, same COALESCE on source_id for NULL safety, same
+    // CASE-WHEN exclusion of target's own source for cross_source_hits.
+    //
+    // Defense-in-depth (codex outside-voice review): deleted_at IS NULL
+    // on both join sides. Matches Postgres-engine parity.
+    const { rows } = await this.db.query(
+      `WITH targets AS (
+         SELECT id, COALESCE(source_id, 'default') AS source_id
+         FROM pages
+         WHERE id = ANY($1::int[])
+           AND deleted_at IS NULL
+       )
+       SELECT
+         l.to_page_id AS to_page_id,
+         COUNT(DISTINCT l.from_page_id)::int AS hits,
+         COUNT(DISTINCT
+           CASE WHEN COALESCE(p.source_id, 'default') <> t.source_id
+                THEN COALESCE(p.source_id, 'default') END
+         )::int AS cross_source_hits
+       FROM links l
+       JOIN pages   p ON p.id = l.from_page_id AND p.deleted_at IS NULL
+       JOIN targets t ON t.id = l.to_page_id
+       WHERE l.from_page_id = ANY($1::int[])
+         AND l.to_page_id   = ANY($1::int[])
+       GROUP BY l.to_page_id
+       HAVING COUNT(DISTINCT l.from_page_id) >= 1`,
+      [pageIds]
+    );
+    for (const r of rows as { to_page_id: number; hits: number; cross_source_hits: number }[]) {
+      result.set(Number(r.to_page_id), {
+        hits: Number(r.hits),
+        cross_source_hits: Number(r.cross_source_hits),
+      });
+    }
+    return result;
+  }
+
   async getPageTimestamps(slugs: string[]): Promise<Map<string, Date>> {
     if (slugs.length === 0) return new Map();
     const { rows } = await this.db.query(

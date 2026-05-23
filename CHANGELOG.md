@@ -114,6 +114,112 @@ The webhook handler had a different bug — caught at test-writing time. `Buffer
 
 **Voyage HMAC bug caught at test-write time** (see "What we caught before merging" above): `Buffer.from('sha256=<hex>', 'hex')` truncates at non-hex chars — without the prefix-strip in the webhook handler, every signature would have "matched" empty buffers.
 
+## [0.40.4.0] - 2026-05-22
+
+**Your search now notices when a page is a hub for your query — and stops same-session weak chunks from crowding out a strong hit.**
+
+GBrain's search already does a lot: it blends keyword and vector matches, reranks them, then nudges the order based on backlinks, salience, and recency. But the graph of links sitting in your brain was mostly wallpaper at query time — we knew which pages linked to which, and we used that count globally (popular pages get a small boost), but we never asked "for THIS query specifically, which top results are connected to each other?" That's the new signal.
+
+Three small, additive moves in the ranker:
+
+1. **Adjacency hub** (×1.05): if a page in the top-K is linked to by 2+ OTHER top-K results, it's a hub for this specific query. Small bump.
+2. **Cross-team hub** (×1.10): if a top-K page is linked from pages in 2+ DIFFERENT sources (not counting its own source), it's corroborated across team brains. Slightly bigger bump. Dormant if you only have one brain — but the moment you mount a team brain or your CEO topology widens, the signal lights up.
+3. **Session diversify** (×0.95): if three results all come from the same chat session, keep the highest-scoring one at full score and DEMOTE the rest. Stops weak chunks from a chatty session from elbowing a strong hit out of the token budget. (The original v1 plan boosted same-session pages — codex caught it was structurally backwards, and we flipped it before merging.)
+
+All three live inside the existing post-fusion stage, so they inherit the v0.35.6.0 floor-ratio gate that prevents weak pages from getting boosted past strong ones via popularity.
+
+Magnitudes are conservative on purpose (1.05/1.10/0.95). A score-distribution probe collects data on top-K reorder-band widths under real use — that data feeds a calibration wave in v0.41+ that tunes the magnitudes against actual ranking shifts, not vibes.
+
+Default on for `balanced` and `tokenmax` modes; off for `conservative`. Opt out per-brain with `gbrain config set search.graph_signals false`.
+
+### How to use it
+
+```bash
+# Check whether it's on (mode default or config override)
+gbrain doctor --json | jq '.checks[] | select(.name == "graph_signals_coverage")'
+
+# Watch what fired in your recent searches
+gbrain search stats --days 7
+# → Graph signals: enabled / failures / fail-rate
+
+# See per-stage attribution for one query
+gbrain search "founders we know in San Francisco" --explain
+# → 1. people/alice (score=12.4)
+#      base=10.2 (rrf+cosine)
+#      + backlink ×1.08
+#      + adjacency ×1.05 (hits=3)
+#      = final 12.4
+
+# Override the mode default
+gbrain config set search.graph_signals false   # opt out
+gbrain config set search.graph_signals true    # opt in for conservative
+```
+
+### Cathedral expansions that came along
+
+This wave grew significantly through review (boil-the-lakes orientation):
+
+- **Per-stage score attribution in EVERY boost stage** (D12=A). Every stage that mutates `score` now stamps a field recording what it multiplied: `backlink_boost`, `salience_boost`, `recency_boost`, `exact_match_boost`, `graph_adjacency_boost`, `graph_cross_source_boost`, `session_demote_factor`, plus a `base_score` snapshot captured once at runPostFusionStages entry. `gbrain search --explain` reads them to render the per-result breakdown above. JSON envelope: same fields surface verbatim under existing `--json` output.
+
+- **Audit-writer unification** (D5=B). The five hand-rolled JSONL audit modules in the codebase (rerank-failures, shell-jobs, supervisor, slug-fallback, phantoms) duplicated the same ISO-week filename math, best-effort write loop, and read-current-plus-previous-week loop. Extracted `src/core/audit/audit-writer.ts` as the shared primitive; refactored all five plus the new `graph-signals-failures` audit onto it. Public API preserved bit-for-bit — every existing test passes unchanged.
+
+- **Eval gates with paired bootstrap** (D13=A). New `test/e2e/graph-signals-eval.test.ts` runs each longmemeval-mini question twice (off vs on) and asserts: (1) paired bootstrap p≥0.05 in the wrong direction OR delta ≥ 0 (no statistically significant regression), (2) mean Jaccard@5 ≥ 0.5 (results didn't shift wildly), (3) top-1 stability ≥ 0.7 (most top picks preserved), (4) recall@5 drop ≤ 5pt absolute (catastrophic catch). 10,000 resamples, deterministic seeded RNG, hermetic via PGLite. Reusable `pairedBootstrapPValue` pure function exported for future calibration waves.
+
+### What's safe to know about
+
+- **Mid-deploy cache hit-rate dip**: `KNOBS_HASH_VERSION` bumps 3→4 so a graph-on cache write can't be served to a graph-off lookup. Existing `query_cache` rows from before the upgrade hash differently — natural row segregation. Clears within `cache.ttl_seconds` (3600s default).
+- **Single-source brains**: cross-source signal is dormant (count is always 0). Adjacency + session diversification still fire normally. No cost.
+- **Remote-server deploys**: graph-signal fail-open events are JSONL-only today (codex outside-voice flagged the split-brain observability). `search stats` shows success metrics on remote, full metrics on local. A DB-backed audit table is filed as T-todo-3 for v0.41+.
+
+### Itemized changes
+
+- `src/core/search/graph-signals.ts` (NEW): `applyGraphSignals` helper with `sessionPrefix`, `computeScoreDistribution`, and `pairedBootstrapPValue`-compatible internal score handling. Constants `ADJACENCY_BOOST=1.05`, `CROSS_SOURCE_BOOST=1.10`, `SESSION_DEMOTE=0.95`, `DEFAULT_TOP_K=20`, threshold mins. Test seam via `adjacencyFn` injection. Fail-open with JSONL audit row.
+- `src/core/search/hybrid.ts`: extended `runPostFusionStages` with 4th stage (`graphSignalsEnabled`, `onGraphMeta`, `onScoreDistribution`). `base_score` stamped at function entry idempotently. Each existing boost stage (`applyBacklinkBoost`, `applySalienceBoost`, `applyRecencyBoost`) stamps its multiplier.
+- `src/core/search/intent-weights.ts`: `applyExactMatchBoost` stamps `exact_match_boost` when fired.
+- `src/core/search/rerank.ts`: `applyReranker` stamps `reranker_delta` (rank delta — positive = improved).
+- `src/core/search/mode.ts`: new `graph_signals: boolean` knob in `ModeBundle`. Defaults: conservative=false, balanced=true, tokenmax=true. `KNOBS_HASH_VERSION` 3→4 with `gs=` parts entry appended per CDX2-F13 convention. `SearchKeyOverrides` + `SearchPerCallOpts` + `loadOverridesFromConfig` + `SEARCH_MODE_CONFIG_KEYS` + `resolveSearchMode` + `attributeKnob` all carry the new field.
+- `src/core/search/explain-formatter.ts` (NEW): renders SearchResult[] as a multi-line per-result breakdown. Reads every boost-stamping field. "no boosts applied" empty path. 4-decimal precision with trailing-zero strip.
+- `src/core/cli-options.ts`: `CliOptions` gains `explain: boolean`. `parseGlobalFlags` recognizes `--explain` anywhere in argv.
+- `src/cli.ts`: `formatResult` for `search` + `query` cases routes to `formatResultsExplain` when `CliOptions.explain` is set.
+- `src/commands/search.ts`: `gbrain search stats` gains `graph_signals` section (enabled/source/failures_count/failures_by_reason). JSON envelope adds a `graph_signals` sibling property to existing stats; `_meta.metric_glossary` adds two new keys. Human output prints the section after the existing block.
+- `src/commands/doctor.ts`: new `graph_signals_coverage` check wired into both `runDoctor` (local) and `doctorReportRemote` (HTTP/JSON path). Reads `search.graph_signals` config first, falls back to mode default; silent ok when disabled; warns at <10% inbound coverage with `gbrain extract all` fix hint; ok at ≥30% ("fire on most queries") and 10-29% ("fire occasionally"), each with the percentage.
+- `src/core/engine.ts`: new `getAdjacencyBoosts(pageIds): Promise<Map<number, AdjacencyRow>>` method. SearchResult type extended with 12 new optional fields (graph signals + attribution).
+- `src/core/postgres-engine.ts` + `src/core/pglite-engine.ts`: `getAdjacencyBoosts` impl with parity SQL. `COALESCE(p.source_id, 'default')` for null safety; `HAVING >= 1` matches JSDoc; cross_source_hits excludes target's own source via CASE-WHEN on JOINed target row.
+- `src/core/types.ts`: `AdjacencyRow` interface + 12 new optional SearchResult fields.
+- `src/core/audit/audit-writer.ts` (NEW): shared primitive (`createAuditWriter`, `computeIsoWeekFilename`, `resolveAuditDir`). 22 unit tests pin the contract.
+- `src/core/rerank-audit.ts`, `src/core/audit-slug-fallback.ts`, `src/core/minions/handlers/shell-audit.ts`, `src/core/minions/handlers/supervisor-audit.ts`, `src/core/facts/phantom-audit.ts`: refactored onto `createAuditWriter`. Public API preserved.
+- Tests added: `test/audit/audit-writer.test.ts` (22), `test/e2e/graph-signals-engine.test.ts` (7), `test/search/graph-signals.test.ts` (24 including the IRON-RULE floor-gate regression), `test/search/attribution-stamping.test.ts` (16), `test/search/explain-formatter.test.ts` (19), `test/search/search-stats-graph-signals.test.ts` (6), `test/e2e/graph-signals-eval.test.ts` (10 — 4 eval gates + 5 pure bootstrap function tests).
+- Tests extended: `test/doctor.test.ts` (7 new for coverage check), `test/search-mode.test.ts` (8 new for graph_signals knob), `test/search/knobs-hash-reranker.test.ts` (version assertion 3→4), `test/cross-modal-phase1.test.ts` (version assertion 3→4), `test/cli-options.test.ts` (3 new for --explain parsing), `test/thin-client-upgrade-prompt.test.ts` (CliOptions literal updated).
+
+### To take advantage of v0.40.4.0
+
+`gbrain upgrade` should pick this up automatically. If your install has `balanced` or `tokenmax` mode (the default), graph signals are already on after upgrade.
+
+1. **Verify it's running:**
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name == "graph_signals_coverage")'
+   ```
+   Expected: `status: "ok"` with a coverage percentage. If you get a warn at <10% coverage, run `gbrain extract all` to populate the link graph from your markdown.
+
+2. **Try it on a query:**
+   ```bash
+   gbrain search "your favorite query" --explain
+   ```
+   You'll see per-stage attribution showing what each boost did.
+
+3. **Opt out if needed:**
+   ```bash
+   gbrain config set search.graph_signals false
+   ```
+
+4. **If something looks wrong**, please file an issue: https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor --json` and one or two `gbrain search ... --explain` examples that look off.
+
+### For contributors
+
+- New shared primitive `src/core/audit/audit-writer.ts` is the way to add JSONL audits going forward. Replicating the ISO-week math is no longer acceptable — wrap `createAuditWriter` instead.
+- `pairedBootstrapPValue` is exported from `test/e2e/graph-signals-eval.test.ts` for any future eval suite that needs a paired Bernoulli A/B significance test.
+- Five TODOs filed for v0.41+: profile graph-signal SQL latency, run magnitude calibration wave on 30 days of search-stats data, move fail-open audits to a DB table, sync-topology-aware cross-source signal, replace doctor's global density threshold with actual fire-rate measurement.
+
 ## [0.40.3.0] - 2026-05-22
 
 **Your search now understands what each chunk is about — AND its cached results expire the moment a page changes.**

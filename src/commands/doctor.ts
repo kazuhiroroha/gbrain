@@ -596,6 +596,12 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   // things when reranker is on vs off.
   checks.push(await checkRerankerHealth(engine));
 
+  // 9a. v0.40.4 graph_signals_coverage: when graph_signals is enabled
+  // (via mode bundle default or explicit config override), surface
+  // whether link density is high enough for the signal to fire
+  // meaningfully. <10% inbound coverage warns; >=30% ok with metric.
+  checks.push(await checkGraphSignalsCoverage(engine));
+
   // 9b. v0.37.0 brainstorm_health: surfaces three brainstorm/lsd readiness
   // signals: (a) migration v79 applied (last_retrieved_at column exists),
   // (b) calibration cold-start status (active_bias_tags empty), (c)
@@ -959,6 +965,112 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
       name: 'reranker_health',
       status: 'warn',
       message: `Could not check reranker audit: ${msg}`,
+    };
+  }
+}
+
+/**
+ * v0.40.4 graph_signals_coverage doctor check.
+ *
+ * Surfaces whether the brain's link density is high enough for the
+ * v0.40.4 graph-signals stage to meaningfully fire. Logic:
+ *
+ *   1. Resolve the active graph_signals setting (config override OR
+ *      mode-bundle default). When OFF → silent ok (no metric noise on
+ *      installs that don't use the feature).
+ *
+ *   2. When ON, compute the global density: % of pages with >=1
+ *      inbound link. This is a STRUCTURAL lower bound — top-K
+ *      subgraphs need at least some edges to fire any signal.
+ *      Codex outside-voice #14 noted this is an imperfect proxy
+ *      (T-todo-5 will replace it with actual fire-rate measurement
+ *      from search-stats after 30 days of data).
+ *
+ *   3. >=30% → ok with the percentage.
+ *      <10%  → warn (mismatch: signal enabled but link graph is too
+ *              sparse to fire often; fix: `gbrain extract all` to
+ *              populate the link graph from frontmatter + markdown).
+ *      10-29% → ok with note (signal will fire occasionally).
+ *
+ * Errors during the SQL count → warn with the underlying message.
+ * Best-effort: this check never breaks doctor.
+ */
+export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Check> {
+  try {
+    // Resolve the active graph_signals setting. Read the config key
+    // explicitly; when unset, fall through to the mode bundle default.
+    const cfgVal = await engine.getConfig('search.graph_signals');
+    let enabled: boolean;
+    if (cfgVal !== null && cfgVal !== undefined) {
+      // v0.40.4 codex F1 — case-insensitive + trim, parity with
+      // loadOverridesFromConfig in src/core/search/mode.ts. Without
+      // this, `gbrain config set search.graph_signals TRUE` enables
+      // the feature in production but doctor reports "disabled".
+      const v = cfgVal.trim().toLowerCase();
+      enabled = v === 'true' || v === '1';
+    } else {
+      // Mode bundle default. Read search.mode (case-insensitive + trim
+      // parity with isSearchMode + DEFAULT_SEARCH_MODE fallback).
+      const modeRaw = await engine.getConfig('search.mode');
+      const modeVal = typeof modeRaw === 'string' ? modeRaw.trim().toLowerCase() : '';
+      const mode = modeVal === 'conservative' || modeVal === 'tokenmax' ? modeVal : 'balanced';
+      // Hardcoded knowledge of the mode bundle defaults — keeps the
+      // doctor check from pulling in the full search/mode.ts surface.
+      enabled = mode !== 'conservative';
+    }
+
+    if (!enabled) {
+      return {
+        name: 'graph_signals_coverage',
+        status: 'ok',
+        message: 'graph_signals disabled — coverage not checked',
+      };
+    }
+
+    // Compute global inbound-link density. Counts DISTINCT pages with
+    // at least one inbound edge / total pages.
+    const totalRows = await engine.executeRaw(`SELECT COUNT(*)::int AS n FROM pages WHERE deleted_at IS NULL`);
+    const totalPages = Number((totalRows as any)[0]?.n ?? 0);
+
+    if (totalPages === 0) {
+      return {
+        name: 'graph_signals_coverage',
+        status: 'ok',
+        message: 'Empty brain — no pages to compute coverage against',
+      };
+    }
+
+    const linkedRows = await engine.executeRaw(
+      `SELECT COUNT(DISTINCT l.to_page_id)::int AS n
+       FROM links l
+       JOIN pages p ON p.id = l.to_page_id
+       WHERE p.deleted_at IS NULL`
+    );
+    const linkedPages = Number((linkedRows as any)[0]?.n ?? 0);
+    const pct = (linkedPages / totalPages) * 100;
+    const pctStr = pct.toFixed(1);
+
+    if (pct < 10) {
+      return {
+        name: 'graph_signals_coverage',
+        status: 'warn',
+        message: `graph_signals enabled but only ${pctStr}% of pages have inbound links (<10%). Signal will rarely fire. Fix: \`gbrain extract all\` to populate the link graph from frontmatter + markdown.`,
+      };
+    }
+
+    return {
+      name: 'graph_signals_coverage',
+      status: 'ok',
+      message: pct >= 30
+        ? `${pctStr}% of pages have inbound links (>=30% — graph signals fire on most queries)`
+        : `${pctStr}% of pages have inbound links (10-29% — graph signals fire occasionally)`,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      name: 'graph_signals_coverage',
+      status: 'warn',
+      message: `Could not check graph_signals_coverage: ${msg}`,
     };
   }
 }
@@ -4338,6 +4450,10 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     // v0.35.0.0+ reranker_health — read JSONL audit; warn on auth or volume.
     progress.heartbeat('reranker_health');
     checks.push(await checkRerankerHealth(engine));
+    // v0.40.4 graph_signals_coverage — global inbound-link density when
+    // graph_signals is enabled in the active mode bundle.
+    progress.heartbeat('graph_signals_coverage');
+    checks.push(await checkGraphSignalsCoverage(engine));
     // v0.37.0 brainstorm_health — migration v79, track_retrieval, calibration cold-start.
     progress.heartbeat('brainstorm_health');
     checks.push(await checkBrainstormHealth(engine));

@@ -163,6 +163,20 @@ export interface ModeBundle {
    * Fires for <1% of queries when on; ~$0.0001 per escalation.
    */
   cross_modal_llm_intent: boolean;
+  /**
+   * v0.40.4 — gate for the graph-signals stage (4th post-fusion stage).
+   * Default: off for conservative, on for balanced + tokenmax. When on,
+   * applyGraphSignals fires inside runPostFusionStages with three sub-
+   * signals (adjacency hub, cross-source hub, session diversification).
+   *
+   * Magnitudes (graph-signals.ts constants): 1.05 / 1.10 / 0.95.
+   * Conservative-by-construction (D14=B); calibration wave T-todo-2
+   * tunes them against real production data after 30 days.
+   *
+   * Override path: per-call SearchOpts → `search.graph_signals` config
+   * key → mode bundle default.
+   */
+  graph_signals: boolean;
 
   /**
    * v0.40.3.0 — contextual retrieval tier per mode. Wraps chunks at embed
@@ -228,6 +242,10 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     unified_multimodal: false,
     unified_multimodal_only: false,
     cross_modal_llm_intent: false,
+    // v0.40.4 — graph signals OFF for conservative (cost-sensitive tier,
+    // matches the "minimize per-query overhead" posture). Signal still
+    // useful for power users via per-call SearchOpts.graph_signals = true.
+    graph_signals: false,
     // v0.40.3.0 contextual retrieval — none for conservative (minimum surface).
     contextual_retrieval: 'none' as CRMode,
     contextual_retrieval_disabled: false,
@@ -264,6 +282,13 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     unified_multimodal: false,
     unified_multimodal_only: false,
     cross_modal_llm_intent: false,
+    // v0.40.4 — graph signals ON for balanced. Adjacency + cross-source
+    // signals exploit the link graph the brain already has; session
+    // diversification stops same-session weak chunks from competing
+    // with strong hits for token budget. Conservative magnitudes
+    // (1.05/1.10/0.95) with floor-gate inheritance keep regression risk
+    // bounded. Opt out with `gbrain config set search.graph_signals false`.
+    graph_signals: true,
     // v0.40.3.0 contextual retrieval — title-only for balanced (free at
     // runtime; pure string concat, no Haiku). Default mode for most users
     // per the cost-tier philosophy.
@@ -299,6 +324,10 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     unified_multimodal: false,
     unified_multimodal_only: false,
     cross_modal_llm_intent: false,
+    // v0.40.4 — graph signals ON for tokenmax (power-user tier). Same
+    // rationale as balanced. The score-distribution probe collects data
+    // for T-todo-2 magnitude calibration wave.
+    graph_signals: true,
     // v0.40.3.0 contextual retrieval — per-chunk Haiku synopsis for tokenmax
     // (Anthropic's published method). One-time backfill cost ~$5-50 for a
     // 10K-page brain; documented in the post-upgrade cost prompt.
@@ -345,6 +374,8 @@ export interface SearchKeyOverrides {
   unified_multimodal?: boolean;
   unified_multimodal_only?: boolean;
   cross_modal_llm_intent?: boolean;
+  // v0.40.4 — graph_signals override (boolean).
+  graph_signals?: boolean;
   // v0.40.3.0 contextual retrieval. CRMode override + soft kill switch.
   contextual_retrieval?: CRMode;
   contextual_retrieval_disabled?: boolean;
@@ -381,6 +412,8 @@ export interface SearchPerCallOpts {
   unified_multimodal?: boolean;
   unified_multimodal_only?: boolean;
   cross_modal_llm_intent?: boolean;
+  // v0.40.4 — graph_signals per-call override (boolean).
+  graph_signals?: boolean;
   // v0.40.3.0 contextual retrieval per-call overrides.
   contextual_retrieval?: CRMode;
   contextual_retrieval_disabled?: boolean;
@@ -452,6 +485,8 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     unified_multimodal: pick('unified_multimodal'),
     unified_multimodal_only: pick('unified_multimodal_only'),
     cross_modal_llm_intent: pick('cross_modal_llm_intent'),
+    // v0.40.4
+    graph_signals: pick('graph_signals'),
     // v0.40.3.0 contextual retrieval — resolved via the same pick chain.
     contextual_retrieval: pick('contextual_retrieval'),
     contextual_retrieval_disabled: pick('contextual_retrieval_disabled'),
@@ -524,12 +559,16 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // extensions both land under v=3, with cross-modal fields appended after
 // the floor_ratio entry (CDX2-F13 append-only convention).
 //
-// v0.39 T21 (master): schema_pack identity fields added under v=4.
+// v0.40.4 bump 3→4: graph_signals participates in the cache key. A
+// graph-on write must NOT be served to a graph-off lookup (ranking
+// shifts when adjacency / cross-source / session-demote stamps move
+// results). v0.39 T21 (master) also added schema_pack identity fields
+// under v=4.
 //
-// v0.40.3.0 (this branch, per D8 sequencing): contextual_retrieval and
-// contextual_retrieval_disabled added under v=5. Sequenced behind salem's
-// pending v=4 graph signals work — first to land claims v=4; second
-// rebases to v=5 (we did, since master's v=4 already landed before us).
+// v0.40.3.0 bump 4→5: contextual_retrieval and contextual_retrieval_disabled
+// added under v=5 (per D8 sequencing — first to land claimed v=4; the
+// contextual-retrieval wave rebased to v=5). Mid-deploy hit-rate dip is
+// expected — clears within cache.ttl_seconds (3600s default).
 export const KNOBS_HASH_VERSION = 5;
 
 /**
@@ -608,10 +647,14 @@ export function knobsHash(
     // must never be served from a row that ran against `embedding`.
     `col=${ctx?.embeddingColumn ?? 'embedding'}`,
     `prov=${ctx?.embeddingModel ?? 'default'}`,
-    // v=4 additions (append-only). v0.39 T21 + codex finding #5: schema-pack
-    // name + version. Cross-pack contamination is structurally impossible
-    // — a query that resolved type `researcher` against pack A cannot be
-    // served from a row that resolved against pack B.
+    // v=4 additions (append-only).
+    //   graph_signals (v0.40.4): graph-on write must not be served to a
+    //     graph-off lookup.
+    //   schema-pack name + version (v0.39 T21 / codex #5): cross-pack
+    //     contamination is structurally impossible — a query that
+    //     resolved type `researcher` against pack A cannot be served
+    //     from a row that resolved against pack B.
+    `gs=${knobs.graph_signals ? 1 : 0}`,
     `pack=${ctx?.schemaPack ?? 'none'}`,
     `pver=${ctx?.schemaPackVersion ?? 'none'}`,
     // v=5 contextual retrieval additions (v0.40.3.0, per D8 sequencing
@@ -762,6 +805,12 @@ export function loadOverridesFromConfig(
     out.contextual_retrieval_disabled = crd === '1' || crd.toLowerCase() === 'true';
   }
 
+  // v0.40.4 — graph_signals
+  const gs = get('search.graph_signals');
+  if (gs !== undefined) {
+    out.graph_signals = gs === '1' || gs.toLowerCase() === 'true';
+  }
+
   return out;
 }
 
@@ -790,6 +839,8 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   'search.unified_multimodal',
   'search.unified_multimodal_only',
   'search.cross_modal.llm_intent',
+  // v0.40.4 graph signals
+  'search.graph_signals',
   // v0.40.3.0 contextual retrieval — tier override + soft kill switch.
   // Per-mode default lives in the bundle; this key lets power users
   // override at the per-key level without flipping the global mode.

@@ -43,13 +43,15 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 5 (master v=4 schema-pack appends; v0.40.3.0 D8 CR appends)', () => {
+  test('version is 5 (1→2 reranker; 2→3 floor_ratio + cross-modal + column; 3→4 v0.40.4 graph_signals + schema_pack; 4→5 v0.40.3.0 contextual_retrieval)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
-    // v0.39 T21 (master): 3→4 to fold schema_pack name + version.
+    // v0.40.4 (salem) + v0.39 T21 (master): 3→4 to fold graph_signals AND
+    // schema_pack name + version (graph-on cache write cannot be served to
+    // graph-off; cross-pack contamination structurally impossible).
     // v0.40.3.0 (D8): 4→5 to fold contextual_retrieval + kill switch,
-    // sequenced behind salem's pending v=4 graph-signals.
+    // sequenced behind salem's v=4 graph-signals.
     expect(KNOBS_HASH_VERSION).toBe(5);
   });
 
