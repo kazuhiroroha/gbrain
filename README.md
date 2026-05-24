@@ -41,7 +41,7 @@ Three things the brain layer did that a typical top-K retrieval cannot:
 2. **Walked the typed-claim Facts fence.** The synthesis combined three separate ARR readings on three different dates into a chronological trajectory with growth multipliers between them.
 3. **Cited every claim.** Every number gets a `[companies/acme-co-0]` citation pointing at the source page — no floating numbers.
 
-Across five multi-page relational questions in Cat 29, GBrain's synthesis layer averages **5.60/10** vs raw retrieval **1.60/10** — a **+4.00 point** Haiku-judged lift, with the brain layer winning 3 of 5 questions. Full receipt + the other four questions: [`docs/benchmarks/2026-05-23-v0.40.6.0-snapshot.md`](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-23-v0.40.6.0-snapshot.md).
+Across five multi-page relational questions in our synthesis benchmark, GBrain's synthesis layer averages **5.60/10** vs raw retrieval **1.60/10** — a **+4.00 point** Haiku-judged lift, with the brain layer winning 3 of 5 questions. Full receipt + the other four questions: [the comprehensive benchmark page](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-23-v0.40.6.0-snapshot.md).
 
 ## Install
 
@@ -56,7 +56,7 @@ gbrain init --pglite
 gbrain skillpack scaffold --all   # or: scaffold <name> per skill
 ```
 
-That's it. Your agent picks up 43 skills (signal detection, brain-ops, ingest, enrich, citation-fixer, daily-task-manager, cron-scheduler, eval framework, and 35 more). Routing lives in `skills/RESOLVER.md` — the agent reads it once per request, picks the right skill, executes. Scaffolded skills are first-class members of your agent repo — you own them, edit freely; `gbrain skillpack reference <name>` diffs your copy against gbrain's bundle when you want to pull upstream improvements. (The legacy `gbrain skillpack install` managed-block model was retired in v0.36.0.0; run `gbrain skillpack migrate-fence` once if you're upgrading from an older release.)
+That's it. Your agent picks up 43 skills (signal detection, brain-ops, ingest, enrich, citation-fixer, daily-task-manager, cron-scheduler, eval framework, and 35 more). Routing lives in `skills/RESOLVER.md` — the agent reads it once per request, picks the right skill, executes. Scaffolded skills are first-class members of your agent repo: you own them, edit freely; `gbrain skillpack reference <name>` diffs your copy against gbrain's bundle when you want to pull upstream improvements.
 
 ### CLI standalone
 
@@ -108,7 +108,7 @@ gbrain think "who's working on AI agents at portfolio companies?"
 
 `gbrain agent run "..."` exposes the same surface to a sub-agent through the Minions queue, with crash-safe two-phase persistence. Same answers, durable.
 
-## How to get data in (v0.38+)
+## How to get data in
 
 One command, local or hosted, synchronous receipt:
 
@@ -119,10 +119,7 @@ echo "from a pipe" | gbrain capture --stdin
 SLUG=$(gbrain capture "..." --quiet)
 ```
 
-The page lands in the DB AND on disk in one move (the v0.38 `put_page`
-write-through plumbing). Default slug `inbox/YYYY-MM-DD-<hash8>` so
-captures cluster in a predictable triage location. On thin-client installs
-the verb routes through MCP to the server — same command, same UX.
+The page lands in the database and on disk in one move. Default slug `inbox/YYYY-MM-DD-<hash8>` so captures cluster in a predictable triage location. On thin-client installs the verb routes through MCP to the server: same command, same UX.
 
 For webhook ingestion (Zapier / IFTTT / Apple Shortcuts):
 
@@ -163,16 +160,15 @@ The active pack threads through every read + write path: `parseMarkdown` infers 
 
 Seven-tier resolution chain (per-call flag → env var → per-source DB key → brain-wide DB key → `gbrain.yml` → `~/.gbrain/config.json` → `gbrain-base` default). Full reference + authoring guide: [`docs/architecture/schema-packs.md`](docs/architecture/schema-packs.md).
 
-## Recent releases
+## Tutorials
 
-- **v0.40.6.0** — `gbrain sync --all` runs every configured source in parallel under a per-source lock invariant. `gbrain sources status` is the new at-a-glance dashboard. Live console prefix shows which source is talking when 6 jobs are running at once.
-- **v0.40.4.0** — per-query graph signals in hybrid search; adjacency, cross-source, and session-demote boosts. `gbrain search --explain` shows per-stage attribution.
-- **v0.40.2.0** — `gbrain think` grounds temporal answers in the typed-claim timeline. Ask "when did Marco last switch jobs" or "what was the ARR in March" and the answer is rooted in real chronology. Default on; flip `think.trajectory_enabled=false` to opt out.
-- **v0.36.4.0** — `gbrain doctor --remediate --yes --target-score 90 --max-usd 5` drives the brain to 90/100 unattended. Cron-safe. Eleven new background-job types; three protected so an MCP-connected agent can't silently burn credits.
-- **v0.36.2.0** — ZeroEntropy is the new default for embedding (`zembed-1` at 1280d via Matryoshka) and reranker (`zerank-2`). 2.2× faster than OpenAI (442ms vs 973ms), 2.6× cheaper ($0.05/M vs $0.13), wins 11 of 20 head-to-head, reshuffles 60% of top-1 results as a second-pass reranker. Bring your own key from [zeroentropy.dev](https://dashboard.zeroentropy.dev), or switch providers at install time with `gbrain init --pglite --embedding-model <provider:model> --embedding-dimensions <N>`.
-- **v0.35.7** — Temporal trajectory + founder scorecard. Author typed metric assertions in the `## Facts` fence (`mrr=50000`, `arr=2000000`, `team_size=12`); `gbrain eval trajectory` prints chronological history with regressions flagged inline. `gbrain founder scorecard` rolls up claim accuracy, consistency, growth direction, red flags. New MCP op `find_trajectory` exposes the same data to agents.
+Step-by-step walkthroughs for getting the most out of GBrain. Each one takes you from zero to a working outcome, with concrete commands and real numbers.
 
-Full notes in [`CHANGELOG.md`](CHANGELOG.md).
+- [**Set up GBrain as your company brain**](docs/tutorials/company-brain.md) — federated, multi-user, OAuth-scoped institutional memory for a 10-50 person team. About 90 minutes end-to-end.
+
+More walkthroughs in progress: connecting an existing agent (Claude Code, Cursor, OpenClaw, Hermes) to a GBrain memory layer; setting up GBrain for VC dealflow with founder scorecards and meeting prep; migrating an existing Notion or Obsidian vault; indexing a codebase as a queryable code brain. Full tutorial index: [`docs/tutorials/`](docs/tutorials/).
+
+Want to see a tutorial that isn't here yet? [Open an issue](https://github.com/garrytan/gbrain/issues) describing the workflow you want documented.
 
 ## What it does (the loop)
 
@@ -191,7 +187,7 @@ The whole loop is described in [`docs/architecture/topologies.md`](docs/architec
 
 ## Capabilities
 
-**Hybrid search.** Vector (HNSW on pgvector) + BM25 keyword + reciprocal-rank fusion + source-tier boost + intent-aware query rewriting. Three named search modes (`conservative`, `balanced`, `tokenmax`) bundle the cost/quality knobs into a single config key. Live cost/recall comparisons in [`docs/eval/SEARCH_MODE_METHODOLOGY.md`](docs/eval/SEARCH_MODE_METHODOLOGY.md). Default: `balanced` with ZeroEntropy reranker on. **New in v0.40.4.0:** per-query graph signals notice when a top result is a hub for THAT query (adjacency boost), is corroborated across team brains (cross-source boost), or is being crowded out by weak chunks from a chatty session (session demote). Run `gbrain search "<query>" --explain` to see per-stage attribution: base score, every boost that fired, what it multiplied. `gbrain doctor` ships a `graph_signals_coverage` check; `gbrain search stats` shows fire counts and failure breakdowns.
+**Hybrid search.** Vector (HNSW on pgvector) + BM25 keyword + reciprocal-rank fusion + source-tier boost + intent-aware query rewriting. Three named search modes (`conservative`, `balanced`, `tokenmax`) bundle the cost/quality knobs into a single config key. Live cost/recall comparisons in [`docs/eval/SEARCH_MODE_METHODOLOGY.md`](docs/eval/SEARCH_MODE_METHODOLOGY.md). Default: `balanced` with ZeroEntropy reranker on. Per-query graph signals notice when a top result is a hub for THAT query (adjacency boost), is corroborated across team brains (cross-source boost), or is being crowded out by weak chunks from a chatty session (session demote). Run `gbrain search "<query>" --explain` to see per-stage attribution: base score, every boost that fired, what it multiplied. `gbrain doctor` ships a `graph_signals_coverage` check; `gbrain search stats` shows fire counts and failure breakdowns.
 
 **Self-wiring knowledge graph.** Every `put_page` extracts entity refs from markdown/wikilinks/typed-link syntax and writes edges with zero LLM calls. Typed edges (`attended`, `works_at`, `invested_in`, `founded`, `advises`, `mentions`, …). Multi-hop traversal via `gbrain graph-query`. The graph is what produces the +31.4 P@5 lift over vector-only RAG.
 
@@ -225,7 +221,7 @@ Data flowing into the brain. Each integration is a recipe — markdown + setup h
 
 ## Troubleshooting
 
-**`gbrain import` fails with `expected N dimensions, not M`?** Run `gbrain doctor`. It will print the exact `gbrain config set ...` or `gbrain retrieval-upgrade` command to repair the mismatch. You should not need to delete `~/.gbrain`. As of v0.37, fresh `gbrain init --pglite` auto-detects your embedding provider from API keys in your environment — set `OPENAI_API_KEY` (or `ZEROENTROPY_API_KEY` / `VOYAGE_API_KEY`) before running init, or pass `--embedding-model <provider>:<model>` explicitly. With multiple keys set, init fires an interactive picker. In non-TTY contexts (CI, Docker) with no keys, init exits 1 with a paste-ready setup hint; pass `--no-embedding` to defer setup until runtime. See [`docs/integrations/embedding-providers.md`](docs/integrations/embedding-providers.md) for the full provider matrix and [`docs/operations/headless-install.md`](docs/operations/headless-install.md) for Docker/CI sequencing.
+**`gbrain import` fails with `expected N dimensions, not M`?** Run `gbrain doctor`. It will print the exact `gbrain config set ...` or `gbrain retrieval-upgrade` command to repair the mismatch. You should not need to delete `~/.gbrain`. Fresh `gbrain init --pglite` auto-detects your embedding provider from API keys in your environment: set `OPENAI_API_KEY` (or `ZEROENTROPY_API_KEY` / `VOYAGE_API_KEY`) before running init, or pass `--embedding-model <provider>:<model>` explicitly. With multiple keys set, init fires an interactive picker. In non-TTY contexts (CI, Docker) with no keys, init exits 1 with a paste-ready setup hint; pass `--no-embedding` to defer setup until runtime. See [`docs/integrations/embedding-providers.md`](docs/integrations/embedding-providers.md) for the full provider matrix and [`docs/operations/headless-install.md`](docs/operations/headless-install.md) for Docker/CI sequencing.
 
 ## Docs
 
@@ -255,4 +251,4 @@ MIT. I built GBrain to run my OpenClaw and Hermes deployments — the production
 
 Origin story: [`docs/ethos/ORIGIN.md`](docs/ethos/ORIGIN.md).
 
-Community PR contributors are credited in `CHANGELOG.md` per release. ZeroEntropy ([@zeroentropy](https://zeroentropy.dev)) for the embedding + reranker stack that became the v0.36.2.0 default. Voyage AI for the asymmetric-encoding recipe template. Ramp Labs for the search quality improvements lineage.
+Community PR contributors are credited in `CHANGELOG.md` per release. ZeroEntropy ([@zeroentropy](https://zeroentropy.dev)) for the embedding + reranker stack that ships as the default. Voyage AI for the asymmetric-encoding recipe template. Ramp Labs for the search quality improvements lineage.
