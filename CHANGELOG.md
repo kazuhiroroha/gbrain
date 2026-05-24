@@ -2,6 +2,39 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.40.8.1] - 2026-05-23
+
+**The README and tutorials are rewritten for someone who has never touched GBrain.** The front-door docs now read as a story you can understand cold: what GBrain does, what it looks like, how to install it, two real walkthroughs that take you from zero to a working brain. No internal jargon, no version archaeology, no assumed context.
+
+The big rewrite covers:
+
+- **README lead** rewritten in first-person voice. Opens with "Search gives you raw pages. GBrain gives you the answer." Frames GBrain as both a personal brain and a company brain, with a link to YC's company-brain Request for Startups.
+- **"What this looks like" section** is now a concrete meeting-prep scenario any professional gets cold: you ask "what do I need to know before my meeting with Alice tomorrow?", you see what a typical retrieval tool returns (a list of 5 pages), you see what GBrain returns (a synthesized briefing with citations and a gap-analysis note). No eval jargon, no judge scores, just the two answers side by side. Closes with "search finds the pages, the brain reads them for you and writes the answer."
+- **New `## Tutorials` section** in the README. Replaces the prior `## Recent Releases` changelog summary (that lives in this file, where it belongs).
+- **New `## Your brain's shape (schema packs)` section** in the README explains the dynamic-schema cathedral in plain English: drop your Notion export or your custom layout, run `gbrain schema detect`, the brain adapts to your shape instead of forcing you to learn its.
+- **All version chatter stripped from the README body.** Per the iron rule "the README should read as the current docs written for people who have never known GBrain before." Version history belongs in this file.
+
+Two new end-to-end tutorials in `docs/tutorials/`:
+
+- **`personal-brain.md`** — the canonical full-stack solo install. Two GitHub repos, a Telegram bot, AlphaClaw on Render, OpenClaw + GBrain + Supabase. About two hours, $100-$150 a month. Includes the three Supabase gotchas every install hits (turn on the `vector` extension, use the connection pooler not the direct connection, buy the IPv4 add-on).
+- **`company-brain.md`** — extends the personal brain into a multi-user shared brain for a 10-50 person team. Federated sources with OAuth-scoped per-user reads, per-person folder conventions, per-person crons, per-person skills, the Slack integration callout (two-cron architecture, channel-to-task-ID mapping, deterministic links, dismissed-items state), and the botmaster onboarding pattern (pre-populate each teammate's slice → walk them through 2-3 wow flows → graduate them to DM only after the wow moment lands).
+- New tutorial-roadmap index at `docs/tutorials/README.md` listing what shipped and what's planned (connect-your-agent, VC dealflow brain, vault migration, code brain, fully-local brain, dream-cycle setup).
+
+Cross-linked from the relevant architecture docs (`docs/INSTALL.md` for the install-path readers, `docs/architecture/topologies.md` for the design-doc readers).
+
+`bun run build:llms` regenerated to pick up the doc structure changes.
+
+### Itemized changes
+
+- `README.md` — first-person lead rewritten; "Search vs Think" section retitled "Two ways to query your brain" (think is a CLI verb, not a brand); company-brain framing paragraph added with YC RFS link; Tutorials section added; `## Your brain's shape (schema packs)` section added; `## Recent Releases` section removed (changelog summary belongs in CHANGELOG.md); all `(v0.X+)` version cites stripped from body; proper-noun capitalization sweep (`alice` → `Alice` in prose, slug forms unchanged); the visceral before/after example rewritten as a universal meeting-prep scenario with zero internal jargon.
+- `docs/tutorials/personal-brain.md` (new) — solo install walkthrough sourced from the live setup session notes. ~2000 words. Includes the three Supabase gotchas (pgvector, connection pooler, IPv4 add-on) in their own subsection.
+- `docs/tutorials/company-brain.md` (new) — multi-user walkthrough, restructured as a true superset of personal-brain (no duplicated install steps). ~5000 words. Covers two scoping models (separate sources with OAuth scoping vs `partners/<slug>/` directory convention in one source), shared rule files at the skills root (`_brain-filing-rules.md`, `_excluded-people.md`, `_output-rules.md`), Slack wiring conventions, and the botmaster onboarding pattern.
+- `docs/tutorials/README.md` (new) — tutorial-roadmap index page.
+- `docs/INSTALL.md` — pointer to the company-brain tutorial in the shared/multi-machine deployment section.
+- `docs/architecture/topologies.md` — pointer to the tutorials directory in the "See also" section.
+- `docs/ethos/ORIGIN.md` — closing paragraph naming the synthesis layer as the reason the brain is worth building.
+- `llms-full.txt` + `llms.txt` — regenerated.
+
 ## [0.40.8.0] - 2026-05-23
 
 **Your doctor checks, your operations trust boundary, and your cycle phases now have real behavioral tests — not just source-grep guards.**
