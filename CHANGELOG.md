@@ -2,6 +2,74 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.40.9.0] - 2026-05-24
+
+**`gbrain sync` now indexes your `.sql` files, and `gbrain code-def` works on SQL tables, functions, views, and indexes the same way it works on TypeScript.**
+
+Until today, point gbrain at a repo that ships database migrations or query libraries and the `.sql` files dropped silently on the floor. The code chunker shipped support for 36 languages — SQL was the conspicuous absence. Closes [#1173](https://github.com/garrytan/gbrain/issues/1173).
+
+Concretely, what changes: `gbrain sync` running over a repo with a `migrations/001_users.sql` file now produces a code page in your brain. Each top-level statement becomes its own chunk. `CREATE TABLE users (...)` lands with `symbol_name='users'` and `symbol_type='table'`. `CREATE OR REPLACE FUNCTION get_user_by_email(...)` lands with `symbol_name='get_user_by_email'` and `symbol_type='function'`. Same for `CREATE VIEW`, `CREATE INDEX`, `CREATE PROCEDURE`, `CREATE TYPE`, `CREATE SCHEMA`, `CREATE DATABASE`, `CREATE TRIGGER`, and `ALTER TABLE` / `ALTER VIEW`. Then `gbrain code-def users` returns the CREATE TABLE site directly — same shape as `gbrain code-def AuthService` on a TypeScript class.
+
+INSERT/UPDATE/DELETE/SELECT statements still get chunked (so a query library stays searchable via vector + keyword) but they emit unnamed — `code-def` is a definition signal, not a query-mention signal, so DML doesn't pollute the symbol surface. PostgreSQL's `$$ ... $$` dollar-quoted function bodies parse cleanly. Files with malformed SQL fall through to the recursive chunker instead of throwing.
+
+**One honesty note about binary size.** The grammar this release vendors (`DerekStride/tree-sitter-sql`) covers PostgreSQL, MySQL, SQLite, and T-SQL basics in one parser. That breadth comes from a 40 MB generated `parser.c` that compiles to an 11 MB WASM. The plan projected 400 KB-1.4 MB before measurement; the real number is ~8x bigger. The compiled gbrain binary grows roughly 6% as a result. If that matters in your deployment, file an issue and we'll evaluate a narrower-coverage fork as a follow-up.
+
+### How to take advantage of v0.40.9.0
+
+Existing brains pick up SQL automatically on the next `gbrain sync` over a repo containing `.sql` files. No migration, no flag, no reembed prompt. No flag exists to turn it off — if you'd previously been ignoring `.sql` files via `.gitignore` and want to keep doing that, that path still works exactly as before.
+
+To verify it works end-to-end on your own brain:
+
+```bash
+gbrain sync                                # syncs any .sql files in your tracked sources
+gbrain code-def <your-table-name>          # should return the CREATE TABLE site
+gbrain code-def <your-function-name>       # should return the CREATE FUNCTION site
+```
+
+If `code-def` returns nothing on a table you know exists in a sync'd `.sql` file, file an issue with the SQL syntax — the DerekStride grammar covers the common dialects but some edge cases (vendor-specific extensions) may parse to a generic statement node where the name isn't reachable via the standard field paths.
+
+### Itemized changes
+
+#### Chunker
+
+- **`src/core/chunkers/code.ts:30+` — vendor `tree-sitter-sql.wasm` (DerekStride/tree-sitter-sql @ c2e1e08db1ea20dc23bdb8d228a81a8756e9c450, built with `tree-sitter-cli@v0.26.3 --abi 14`).** ABI 14 chosen explicitly because gbrain's `web-tree-sitter@0.22.6` supports ABI range 13-14; the CLI's default ABI 15 is incompatible (verified by a load-time `Incompatible language version 15. Compatibility range 13 through 14.` throw during Step 0 grammar inspection). Binary is 11 MB.
+- **`src/core/chunkers/code.ts:121-125` — `SupportedCodeLanguage` union extended with `'sql'`.**
+- **`src/core/chunkers/code.ts:199-229` — `LANGUAGE_MANIFEST` registers `sql: { displayName: 'SQL', embeddedPath: G_SQL }`.**
+- **`src/core/chunkers/code.ts:410+` — `detectCodeLanguage('foo.sql')` returns `'sql'` (case-insensitive).**
+- **`src/core/chunkers/code.ts:325+` — `TOP_LEVEL_TYPES.sql = new Set(['statement'])` catch-all.** DerekStride's grammar wraps every top-level statement in a single `statement` node whose only named child carries the actual kind. The Step 0 grammar-inspection script (`tools/inspect-sql-grammar.ts`) verified this shape against 9 representative SQL fixtures.
+- **`src/core/chunkers/code.ts:1025+` — `extractSymbolName` gains an inline SQL branch.** When the node is `type === 'statement'` with a single named child, it dives into `extractSqlSymbolName(node.namedChild(0))`. That helper recognizes 11 DDL kinds (`create_table`, `create_view`, `create_index`, `create_function`, `create_procedure`, `create_type`, `create_schema`, `create_database`, `create_trigger`, `alter_table`, `alter_view`) and pulls the target identifier from the inner node's `name` field, with fallback to the first `object_reference`/`identifier`-shaped child. Six DML kinds (`select`, `insert`, `update`, `delete`, `merge`, `with`) deliberately return null so chunks emit unnamed.
+- **`src/core/chunkers/code.ts:1044+` — `normalizeSymbolType` gains parallel SQL branches** mapping `create_table → 'table'`, `create_view`/`alter_view → 'view'`, `create_index → 'index'`, `create_procedure → 'procedure'`, `create_type → 'type'`, `create_schema → 'schema'`, `create_database → 'database'`, `create_trigger → 'trigger'`, `alter_table → 'table'`.
+- **`src/core/chunkers/code.ts:639+` — chunker emit-path passes the inner-child type to `normalizeSymbolType` when the outer node is `statement`** so chunk headers say "[SQL] file.sql:1-5 table users" instead of "statement users".
+
+#### Sync routing
+
+- **`src/core/sync.ts:88+` — `CODE_EXTENSIONS` adds `'.sql'`.** `isCodeFilePath('migrations/001_init.sql')` now returns `true`, routing through `importCodeFile()` with `page_kind='code'`.
+
+#### `gbrain code-def` extension
+
+- **`src/commands/code-def.ts:35` — `DEF_TYPES` allowlist extended with `'table'`, `'view'`, `'index'`, `'procedure'`, `'schema'`, `'database'`, `'trigger'`.** Without this, the chunks were indexed correctly but invisible to `gbrain code-def <name>` because the SQL `symbol_type` values fell outside the hardcoded definition-types filter. This was the load-bearing missing piece codex caught in `/plan-eng-review` (F2 finding).
+
+#### Tools + docs
+
+- **`tools/inspect-sql-grammar.ts` (NEW)** — one-shot Step 0 inspection script. Loads the vendored wasm via `web-tree-sitter`, parses 9 representative SQL fixtures (CREATE TABLE / FUNCTION / INDEX / VIEW / ALTER TABLE / CREATE TYPE / mixed DDL+DML / pure DML / invalid SQL), prints top-level node types + the `extractSymbolName` generic output. Output drove the `TOP_LEVEL_TYPES` + `extractSqlSymbolName` design decisions.
+- **`CLAUDE.md`** — grammar count bumped 36→37 with the DerekStride SHA + ABI rationale + 11 MB size disclosure. `src/core/chunkers/` entry extended with the SQL branch documentation.
+- **`llms.txt` + `llms-full.txt`** — regenerated via `bun run build:llms` (CI gate).
+
+#### Tests
+
+- **`test/chunkers/code.test.ts`** — 8 new SQL cases: extension count bump 29→30, `Schema.SQL` case-insensitivity, CREATE TABLE/FUNCTION/INDEX/VIEW/ALTER TABLE each extract correct symbolName + symbolType, DML emits unnamed chunks, mixed DDL+DML per-statement emission, header includes `[SQL]` tag, invalid SQL doesn't crash the parser.
+- **`test/sync-classifier-widening.test.ts`** — 1 new case: SQL extensions classified as code (case-insensitive).
+- **`test/e2e/code-indexing.test.ts`** — 7 new cases against real PGLite. The load-bearing canary asserts `findCodeDef(engine, 'users_account_...', { language: 'sql' })` returns the CREATE TABLE site with `symbol_type='table'`. `beforeAll` timeout bumped to 30s (92-migration replay + 11 MB grammar load pushes past the default 5s on slower CI runners).
+
+### Decisions captured during `/plan-eng-review`
+
+- **D1** (scope, initial): bundle `.sql` + TS/JS JSDoc extraction. Reverted by D6.
+- **D2** (grammar source): `DerekStride/tree-sitter-sql` over the official-org fork. Active maintenance, broad dialect coverage, MIT, reproducible wasm build.
+- **D3** (TOP_LEVEL_TYPES): filtered to schema-defining statements. Corrected by Step 0 to catch-all `statement` because DerekStride wraps every top-level statement in that node type.
+- **D4** (CHUNKER_VERSION): bump 4→5 + wire post-upgrade reembed prompt. Dropped by D6 (no longer needed without JSDoc).
+- **D5** (JSDoc extraction): preceding-sibling AST scan. Dropped by D6.
+- **D6** (scope correction, post-codex): strip JSDoc + CHUNKER_VERSION + reembed-prompt. Keep `.sql` + add SQL symbol-name extraction. Driven by codex's F2 finding that SQL chunking without symbol extraction is "just searchable text," not code intelligence.
+
 ## [0.40.8.0] - 2026-05-23
 
 **Your doctor checks, your operations trust boundary, and your cycle phases now have real behavioral tests — not just source-grep guards.**
