@@ -1,5 +1,115 @@
 # TODOS
 
+## v0.41 content-sanity follow-ups (filed during ship of `garrytan/lint-page-size-gate`)
+
+Source: CEO + Eng review on the content-sanity defense plan. Both reviews
+ran Codex (round 1 + round 2 — 30 total findings) and the wave shipped
+with the strategic items addressed. These are the deliberately-deferred
+follow-ups, captured here so v0.42 starts informed.
+
+- [ ] **v0.42 P1 — Chunk-level embed-quarantine.** The v0.41 wave landed
+  page-level soft-block (`frontmatter.embed_skip`); Codex r1 #3 caught
+  that staleness is chunk-based (`content_chunks.embedding IS NULL`).
+  Right granularity for the embed-pipeline-overflow case is per-chunk,
+  not per-page. Move: add `content_chunks.embed_quarantined_at TIMESTAMPTZ`
+  + partial index, catch `TokenLimitError` from gateway, mark the offending
+  chunk only (keep good siblings), surface in doctor's
+  `embedding_coverage`. Requires repro of the original 890K embed failure
+  on current code FIRST to confirm whether it's batch-overflow vs
+  single-oversized-chunk vs token-estimate-miss. Effort: human ~2 days /
+  CC ~3 hours.
+
+- [ ] **v0.42 P1 — Source-repo remediation surface.** Codex r1 #7
+  caught: cleanup CLI that deletes DB rows doesn't fix source of truth
+  — junk file in source repo reappears on next sync. Move: add
+  `gbrain sources prune-junk <id>` that walks `local_path`, finds files
+  matching the junk-pattern set, soft-deletes DB rows AND `git rm`s the
+  files in the source repo (commit message: `auto: prune junk pages
+  flagged by gbrain content-sanity`). Operator pushes the commit.
+  Pairs with the v0.42 chunk-quarantine for a complete cleanup story.
+  Effort: human ~1 day / CC ~2 hours.
+
+- [ ] **v0.41 + 30 days — Threshold default validation post-deploy.**
+  Codex r1 #15 caught: we invented 50K warn / 500K block thresholds
+  before measuring real corpus distribution. Move: run `gbrain sources
+  audit <id>` on real source repos (start with Garry's own brain),
+  collect distribution stats from the JSON envelope, tune defaults
+  if the measured p99 disagrees with the 50K assumption. Either
+  publish updated defaults in a v0.41.x patch or document the env
+  override path in CHANGELOG. Effort: human ~30min / CC ~10min.
+
+- [ ] **v0.42 P2 — Pages soft-delete CLI (`gbrain pages soft-delete
+  --where`).** Cherry-pick 3 from the original CEO review; dropped
+  during eng review because Codex r1 #7 weakened it (doesn't fix
+  source-of-truth). Resurface in v0.42 as a PAIRED tool alongside
+  the v0.42 source-repo remediation. Filter expressions:
+  `matches_junk_pattern`, `bytes > N`. Required UX gates: `--dry-run`
+  preview, `--confirm-destructive` flag when affected > 0, 1000-page
+  per-invocation cap. Routes through existing `engine.softDeletePage()`
+  (v0.26.5 72h-TTL safe-delete; reversible).
+
+- [ ] **v0.42 P3 — Brain-score `no_junk_pages_score` component.**
+  Add a 6th component to the v0.36.4.0 5-component brain-score
+  formula (currently embed_coverage 35 + link_density 25 +
+  timeline_coverage 15 + no_orphans 15 + no_dead_links 10). Reweight
+  to make room (probably take 5 from no_dead_links: 35/25/15/15/5/5).
+  File AFTER v0.41's audit JSONL has 30+ days of signal so we know
+  the realistic distribution of junk-page rates across brains before
+  pinning a score weight.
+
+- [ ] **post-v0.45 — Operator-supplied regex extensibility.** Dropped
+  in v0.41 per Codex r1 #10 (JavaScript RegExp lacks atomic groups /
+  possessive quantifiers, making a reliable ReDoS shape detector
+  hard). The v0.41 ship has literal-substring extensibility instead
+  which covers ~95% of real operator use cases. If real operators
+  ask for regex, add it with a real story: either re2 (Google's
+  linear-time engine; native dep, build complications) or worker-
+  thread per-pattern timeout (50ms cap, runtime overhead).
+
+- [ ] **post-v0.45 — HTML-density rule.** Dropped in v0.41 per Codex
+  r1 #16. Was: flag pages where `<div>`/`<span>`/etc tag density is
+  too high (raw HTML dump indicator). Requires careful handling of
+  fenced code blocks, JSX/XML in technical notes, escaped HTML.
+  Without that rigor, false-positives on legitimate code-heavy
+  technical writing. The scraper-junk pattern set catches the real
+  junk class without needing density math; revisit only if a junk
+  pattern leaks through that ONLY density would catch.
+
+- [ ] **v0.41+ — Bytes parity assertion across lint + doctor.** D2
+  acceptance test included in `test/content-sanity.test.ts` as a
+  unit-level parity check. Promote to an E2E that seeds a real
+  fixture page with frontmatter + body, runs `gbrain lint` AND
+  `gbrain doctor --content-audit`, asserts both surfaces report
+  the same byte count. Catches drift between
+  `Buffer.byteLength` (assessor) and `octet_length` (doctor SQL)
+  if either surface changes the measurement axis.
+
+- [ ] **v0.41+ — `gbrain sources audit` E2E pin test.** The CLI
+  shipped with unit tests pinning `assessContentSanity` shape;
+  the integration test (walk a fixture source dir, run the CLI
+  end-to-end, assert JSON envelope shape) is deferred. Trivial to
+  add (~30 LOC) once a stable test fixture set lands under
+  `test/fixtures/content-sanity/`.
+
+- [ ] **v0.41+ — Doctor checks integration tests.** The 3 new doctor
+  checks (`oversized_pages`, `scraper_junk_pages`,
+  `content_sanity_audit_recent`) ship verified by typecheck +
+  runtime-shape via the unit suite. Integration tests (seed fixture
+  pages into PGLite, run doctor, assert check status + message
+  format) are deferred. Same pattern as existing
+  `test/doctor.test.ts` extensions.
+
+- [ ] **v0.41+ — 5-path narrow-waist E2E pin tests (cherry-pick 5).**
+  Sync + import + put_page MCP + capture + /ingest webhook all
+  route through `importFromContent` so the new gate applies
+  uniformly. Unit tests pin the gate behavior; E2E pin tests
+  prove each ingestion path actually goes through it. Tests for
+  sync + import + put_page MCP + capture are PGLite-hermetic;
+  the /ingest webhook test needs real-Postgres E2E (DATABASE_URL).
+  Filed during eng review as P2; not blocking ship since the
+  narrow-waist contract is structurally enforced by every wrapper
+  routing through `importFromContent` already.
+
 ## v0.41+ wave commitments (decided 2026-05-23)
 
 Source: `/plan-ceo-review` + `/plan-eng-review` triage of TODOS as roadmap

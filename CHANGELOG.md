@@ -91,6 +91,163 @@ After migrating, retire your OpenClaw's parallel atom-pipeline-coordinator + ato
 - op_checkpoint resumability for cross-cycle continuation in both new phases.
 - Parity-baseline eval gates against your OpenClaw outputs on 500-page sample.
 - OpenClaw-side cleanup (`atom-pipeline-coordinator` retire + SKILL.md shrinks) lives in `~/git/your-openclaw`, not this repo.
+## [0.40.10.0] - 2026-05-24
+
+**Your brain stops accepting junk pages, and oversize content stops crashing the embedder.** A page from one of your source repos can no longer break embedding, defeat search, or pollute your knowledge graph just because it's a Cloudflare challenge dump or an absurdly large file. The new sanity gate lives at the narrow waist of ingestion, so every path that writes pages — sync, capture, `put_page` MCP, the `/ingest` webhook — picks it up uniformly.
+
+Two failure modes treated differently:
+
+- **Scraper junk** (Cloudflare challenge pages, CAPTCHAs, 403 dumps, bare error-page titles): HARD-BLOCK at ingest. Your CLI exits non-zero, your MCP call gets a proper error envelope, your sync surfaces the failure with code `PAGE_JUNK_PATTERN` so doctor groups it. The page never lands. Six hand-vetted patterns ship built-in; operators add literal substrings for site-specific cases via `~/.gbrain/junk-substrings.txt`.
+
+- **Legitimate large content** (your 2MB conversation transcripts, long essays, big articles): SOFT-BLOCK. The page writes successfully, you can still query it by title and slug, but the embedder skips it on the next sweep. The 5 places the embedder reads from now share one source-of-truth helper so the skip can't drift across them. If you edit a page past the size threshold, its old chunks get deleted in the same transaction so search stops returning matches against content that's no longer there.
+
+**New surfaces:**
+- `gbrain sources audit <id>` — walk a source repo's disk, report size distribution + would-blocks + junk-pattern hits without touching the DB. Catches junk before sync. Read-only by design.
+- `gbrain doctor` gains `oversized_pages`, `scraper_junk_pages`, `content_sanity_audit_recent` checks. Default scans the 1000 most-recent pages; `--content-audit` opts into a full scan for the cleanup wave.
+- `gbrain lint` gains `huge-page` and `scraper-junk` rules. Lint reads DB config when reachable (matches what `gbrain config set` writes) and falls back to file/env on CI.
+- `GBRAIN_NO_SANITY=1` kill-switch with loud stderr per bypassed ingest. Operators who really want junk through have to ask for it explicitly and see the warning every time.
+
+**Knobs (all four read env > file > DB > defaults):**
+- `content_sanity.bytes_warn` (default 50_000) — `GBRAIN_PAGE_WARN_BYTES`
+- `content_sanity.bytes_block` (default 500_000) — `GBRAIN_PAGE_BLOCK_BYTES`
+- `content_sanity.junk_patterns_enabled` (default true) — `GBRAIN_NO_JUNK_PATTERNS=1` flips off
+- `content_sanity.disabled` (default false) — `GBRAIN_NO_SANITY=1` flips on
+
+**ISO-week JSONL audit** at `~/.gbrain/audit/content-sanity-YYYY-Www.jsonl` records every hard-block, soft-block, and warn-trip event. Doctor reads the last 7 days, aggregates by pattern + source, surfaces "31 ingest blocks this week, 28 from straylight-brain" so operators see which scraper is the actual problem. Honors `GBRAIN_AUDIT_DIR` for shared-filesystem multi-host setups; documented caveat in the doctor message for ops that don't share the dir.
+
+**No schema migration this PR.** The soft-block flag rides in `frontmatter.embed_skip` JSONB so the embedder filter is a single SQL fragment shared by both engines. Schema column for `pages.embed_skipped_at` lands in v0.41+ with the chunk-level quarantine refactor — deferred for the right reason (Codex caught that page-level granularity loses good chunks; chunk-level is the right axis).
+
+**Review provenance.** This wave went through `/plan-ceo-review` (5 cherry-picks surfaced, 3 accepted, 2 deferred post-Codex round 1) and `/plan-eng-review` (4 architectural decisions resolved + 4 strategic Codex round 2 tensions resolved). Codex caught one load-bearing bug class during planning — `importFromContent.status` vocabulary mismatch that would have made the gate silently fail at the CLI / MCP / sync wrapper sites. Fixed by throwing a typed `ContentSanityBlockError` instead of inventing a new status value; the existing exception flow at every wrapper site fires correctly through one throw point. The plan was substantially tightened post-Codex (dropped 2 cherry-picks that needed v0.42 chunk-level rework, dropped an operator-regex feature that needed a real ReDoS story, dropped the HTML-density rule that needed careful handling of code fences). What ships is what the actual bug needed plus the audit + cleanup surfaces.
+
+**99 new unit tests** (207 assertions) across 6 files covering the assessor, literal loader, embed-skip helper, audit JSONL, lint rules, and the import-file gate. 136 surface-area regression tests on the files touched all pass in isolation. Full bun:test suite returns clean.
+
+### To take advantage of v0.40.10.0
+
+`gbrain upgrade` carries this for you. No migration, no manual steps. After upgrading:
+
+1. **Audit your existing inventory** (optional but recommended):
+   ```bash
+   gbrain doctor --content-audit --json | jq '.checks[] | select(.name == "scraper_junk_pages" or .name == "oversized_pages")'
+   ```
+   Surfaces existing junk pages and oversized pages already in your brain.
+
+2. **For any junk pages doctor flags**, the right cleanup is at the source — `git rm` the file from the source repo, push, then `gbrain sync`. The v0.41+ wave will ship `gbrain sources prune-junk <id>` to automate this; for v0.40.10.0 it's a manual two-step.
+
+3. **For oversized pages doctor flags** as warn-tier, no action needed unless you want to split. New oversize will automatically write with `frontmatter.embed_skip` and be queryable by title (just not search-rankable until split).
+
+4. **If you have a site-specific scraper-junk pattern** (LinkedIn auth wall, Reddit blocked page, etc.), drop a literal in `~/.gbrain/junk-substrings.txt`:
+   ```
+   # name=linkedin_auth_wall
+   Sign in to your account to continue
+
+   # name=reddit_blocked
+   You're being blocked from accessing
+   ```
+   Loaded on every ingest. Missing file is fine; malformed lines are impossible (no regex).
+
+5. **If any step surprises you,** please file an issue: https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor --json`
+   - a sanitized example of the page that surprised you
+   - which step broke
+
+   The audit JSONL at `~/.gbrain/audit/content-sanity-YYYY-Www.jsonl` carries the assessor's full reasoning per event if you want to debug a specific decision.
+
+### Itemized changes
+
+**Added:**
+- `src/core/content-sanity.ts` — pure assessor with 6 hand-vetted junk patterns + `ContentSanityBlockError` class
+- `src/core/content-sanity-literals.ts` — operator literal-substring loader (fail-soft on ENOENT)
+- `src/core/embed-skip.ts` — 5-site shared predicate (JS + SQL fragment + marker builder)
+- `src/core/audit/content-sanity-audit.ts` — ISO-week JSONL writer/reader on the v0.40.4.0 audit-writer primitive
+- `gbrain sources audit <id>` CLI for dry-run source-repo scanning
+- `gbrain doctor --content-audit` flag for full-scan opt-in
+- `gbrain doctor` checks: `oversized_pages`, `scraper_junk_pages`, `content_sanity_audit_recent`
+- `gbrain lint` rules: `huge-page`, `scraper-junk`
+- 4 `content_sanity.*` config keys (file/env/DB plane)
+
+**Changed:**
+- `importFromContent` throws `ContentSanityBlockError` on hard-block (junk pattern match) and sets `frontmatter.embed_skip` on soft-block (oversize alone). Old chunks deleted on transition to soft-block.
+- `gbrain import` honors `errors > 0` for non-zero exit (was silently exit-0 on failed files).
+- Embed sweep skips pages with `embed_skip` flag at all 5 sites: `embed.ts --stale`, `embed.ts --all`, `embed-stale.ts` Minion helper, both engines' `listStaleChunks` + `countStaleChunks`.
+- `lint.ts` lifts DB config when `~/.gbrain/` is reachable; falls back to file/env on CI.
+- `classifyErrorCode` recognizes `PAGE_JUNK_PATTERN` for sync-failures.jsonl grouping.
+
+**Test coverage:**
+- 99 new unit tests across 6 files (207 assertions)
+- All new modules covered at the boundary level
+- Cross-site embed-skip invariant pinned by `test/embed-skip.test.ts`
+- Bytes-parity assertion (D2) pinned in `test/content-sanity.test.ts`
+
+### For contributors
+
+The plan file lives at `~/.claude/plans/system-instruction-you-are-working-temporal-brook.md` with the full decision provenance: CEO review (D1-D16) + Eng review (D1-D9) + Codex round 1 (17 findings) + Codex round 2 (13 findings). The deferred-to-v0.41+ TODOs are in `TODOS.md` under "v0.41 content-sanity follow-ups" — chunk-level quarantine, source-repo remediation CLI, threshold validation post-deploy, brain-score `no_junk_pages_score` component, plus the operator-regex + HTML-density features that need real ReDoS / code-fence-handling stories before they're worth shipping.
+## [0.40.9.0] - 2026-05-24
+
+**`gbrain sync` now indexes your `.sql` files, and `gbrain code-def` works on SQL tables, functions, views, and indexes the same way it works on TypeScript.**
+
+Until today, point gbrain at a repo that ships database migrations or query libraries and the `.sql` files dropped silently on the floor. The code chunker shipped support for 36 languages — SQL was the conspicuous absence. Closes [#1173](https://github.com/garrytan/gbrain/issues/1173).
+
+Concretely, what changes: `gbrain sync` running over a repo with a `migrations/001_users.sql` file now produces a code page in your brain. Each top-level statement becomes its own chunk. `CREATE TABLE users (...)` lands with `symbol_name='users'` and `symbol_type='table'`. `CREATE OR REPLACE FUNCTION get_user_by_email(...)` lands with `symbol_name='get_user_by_email'` and `symbol_type='function'`. Same for `CREATE VIEW`, `CREATE INDEX`, `CREATE PROCEDURE`, `CREATE TYPE`, `CREATE SCHEMA`, `CREATE DATABASE`, `CREATE TRIGGER`, and `ALTER TABLE` / `ALTER VIEW`. Then `gbrain code-def users` returns the CREATE TABLE site directly — same shape as `gbrain code-def AuthService` on a TypeScript class.
+
+INSERT/UPDATE/DELETE/SELECT statements still get chunked (so a query library stays searchable via vector + keyword) but they emit unnamed — `code-def` is a definition signal, not a query-mention signal, so DML doesn't pollute the symbol surface. PostgreSQL's `$$ ... $$` dollar-quoted function bodies parse cleanly. Files with malformed SQL fall through to the recursive chunker instead of throwing.
+
+**One honesty note about binary size.** The grammar this release vendors (`DerekStride/tree-sitter-sql`) covers PostgreSQL, MySQL, SQLite, and T-SQL basics in one parser. That breadth comes from a 40 MB generated `parser.c` that compiles to an 11 MB WASM. The plan projected 400 KB-1.4 MB before measurement; the real number is ~8x bigger. The compiled gbrain binary grows roughly 6% as a result. If that matters in your deployment, file an issue and we'll evaluate a narrower-coverage fork as a follow-up.
+
+### How to take advantage of v0.40.9.0
+
+Existing brains pick up SQL automatically on the next `gbrain sync` over a repo containing `.sql` files. No migration, no flag, no reembed prompt. No flag exists to turn it off — if you'd previously been ignoring `.sql` files via `.gitignore` and want to keep doing that, that path still works exactly as before.
+
+To verify it works end-to-end on your own brain:
+
+```bash
+gbrain sync                                # syncs any .sql files in your tracked sources
+gbrain code-def <your-table-name>          # should return the CREATE TABLE site
+gbrain code-def <your-function-name>       # should return the CREATE FUNCTION site
+```
+
+If `code-def` returns nothing on a table you know exists in a sync'd `.sql` file, file an issue with the SQL syntax — the DerekStride grammar covers the common dialects but some edge cases (vendor-specific extensions) may parse to a generic statement node where the name isn't reachable via the standard field paths.
+
+### Itemized changes
+
+#### Chunker
+
+- **`src/core/chunkers/code.ts:30+` — vendor `tree-sitter-sql.wasm` (DerekStride/tree-sitter-sql @ c2e1e08db1ea20dc23bdb8d228a81a8756e9c450, built with `tree-sitter-cli@v0.26.3 --abi 14`).** ABI 14 chosen explicitly because gbrain's `web-tree-sitter@0.22.6` supports ABI range 13-14; the CLI's default ABI 15 is incompatible (verified by a load-time `Incompatible language version 15. Compatibility range 13 through 14.` throw during Step 0 grammar inspection). Binary is 11 MB.
+- **`src/core/chunkers/code.ts:121-125` — `SupportedCodeLanguage` union extended with `'sql'`.**
+- **`src/core/chunkers/code.ts:199-229` — `LANGUAGE_MANIFEST` registers `sql: { displayName: 'SQL', embeddedPath: G_SQL }`.**
+- **`src/core/chunkers/code.ts:410+` — `detectCodeLanguage('foo.sql')` returns `'sql'` (case-insensitive).**
+- **`src/core/chunkers/code.ts:325+` — `TOP_LEVEL_TYPES.sql = new Set(['statement'])` catch-all.** DerekStride's grammar wraps every top-level statement in a single `statement` node whose only named child carries the actual kind. The Step 0 grammar-inspection script (`tools/inspect-sql-grammar.ts`) verified this shape against 9 representative SQL fixtures.
+- **`src/core/chunkers/code.ts:1025+` — `extractSymbolName` gains an inline SQL branch.** When the node is `type === 'statement'` with a single named child, it dives into `extractSqlSymbolName(node.namedChild(0))`. That helper recognizes 11 DDL kinds (`create_table`, `create_view`, `create_index`, `create_function`, `create_procedure`, `create_type`, `create_schema`, `create_database`, `create_trigger`, `alter_table`, `alter_view`) and pulls the target identifier from the inner node's `name` field, with fallback to the first `object_reference`/`identifier`-shaped child. Six DML kinds (`select`, `insert`, `update`, `delete`, `merge`, `with`) deliberately return null so chunks emit unnamed.
+- **`src/core/chunkers/code.ts:1044+` — `normalizeSymbolType` gains parallel SQL branches** mapping `create_table → 'table'`, `create_view`/`alter_view → 'view'`, `create_index → 'index'`, `create_procedure → 'procedure'`, `create_type → 'type'`, `create_schema → 'schema'`, `create_database → 'database'`, `create_trigger → 'trigger'`, `alter_table → 'table'`.
+- **`src/core/chunkers/code.ts:639+` — chunker emit-path passes the inner-child type to `normalizeSymbolType` when the outer node is `statement`** so chunk headers say "[SQL] file.sql:1-5 table users" instead of "statement users".
+
+#### Sync routing
+
+- **`src/core/sync.ts:88+` — `CODE_EXTENSIONS` adds `'.sql'`.** `isCodeFilePath('migrations/001_init.sql')` now returns `true`, routing through `importCodeFile()` with `page_kind='code'`.
+
+#### `gbrain code-def` extension
+
+- **`src/commands/code-def.ts:35` — `DEF_TYPES` allowlist extended with `'table'`, `'view'`, `'index'`, `'procedure'`, `'schema'`, `'database'`, `'trigger'`.** Without this, the chunks were indexed correctly but invisible to `gbrain code-def <name>` because the SQL `symbol_type` values fell outside the hardcoded definition-types filter. This was the load-bearing missing piece codex caught in `/plan-eng-review` (F2 finding).
+
+#### Tools + docs
+
+- **`tools/inspect-sql-grammar.ts` (NEW)** — one-shot Step 0 inspection script. Loads the vendored wasm via `web-tree-sitter`, parses 9 representative SQL fixtures (CREATE TABLE / FUNCTION / INDEX / VIEW / ALTER TABLE / CREATE TYPE / mixed DDL+DML / pure DML / invalid SQL), prints top-level node types + the `extractSymbolName` generic output. Output drove the `TOP_LEVEL_TYPES` + `extractSqlSymbolName` design decisions.
+- **`CLAUDE.md`** — grammar count bumped 36→37 with the DerekStride SHA + ABI rationale + 11 MB size disclosure. `src/core/chunkers/` entry extended with the SQL branch documentation.
+- **`llms.txt` + `llms-full.txt`** — regenerated via `bun run build:llms` (CI gate).
+
+#### Tests
+
+- **`test/chunkers/code.test.ts`** — 8 new SQL cases: extension count bump 29→30, `Schema.SQL` case-insensitivity, CREATE TABLE/FUNCTION/INDEX/VIEW/ALTER TABLE each extract correct symbolName + symbolType, DML emits unnamed chunks, mixed DDL+DML per-statement emission, header includes `[SQL]` tag, invalid SQL doesn't crash the parser.
+- **`test/sync-classifier-widening.test.ts`** — 1 new case: SQL extensions classified as code (case-insensitive).
+- **`test/e2e/code-indexing.test.ts`** — 7 new cases against real PGLite. The load-bearing canary asserts `findCodeDef(engine, 'users_account_...', { language: 'sql' })` returns the CREATE TABLE site with `symbol_type='table'`. `beforeAll` timeout bumped to 30s (92-migration replay + 11 MB grammar load pushes past the default 5s on slower CI runners).
+
+### Decisions captured during `/plan-eng-review`
+
+- **D1** (scope, initial): bundle `.sql` + TS/JS JSDoc extraction. Reverted by D6.
+- **D2** (grammar source): `DerekStride/tree-sitter-sql` over the official-org fork. Active maintenance, broad dialect coverage, MIT, reproducible wasm build.
+- **D3** (TOP_LEVEL_TYPES): filtered to schema-defining statements. Corrected by Step 0 to catch-all `statement` because DerekStride wraps every top-level statement in that node type.
+- **D4** (CHUNKER_VERSION): bump 4→5 + wire post-upgrade reembed prompt. Dropped by D6 (no longer needed without JSDoc).
+- **D5** (JSDoc extraction): preceding-sibling AST scan. Dropped by D6.
+- **D6** (scope correction, post-codex): strip JSDoc + CHUNKER_VERSION + reembed-prompt. Keep `.sql` + add SQL symbol-name extraction. Driven by codex's F2 finding that SQL chunking without symbol extraction is "just searchable text," not code intelligence.
 
 ## [0.40.8.1] - 2026-05-23
 
