@@ -1,5 +1,24 @@
 # TODOS
 
+## community-pr-wave follow-ups (filed during ship)
+
+- [ ] **`probeEmbeddingReachability` should honor recipe `default_timeout_ms`
+  for embed touchpoint.** The reranker probe was just fixed in PR #1326 to
+  read `recipe.touchpoints.reranker.default_timeout_ms` so Qwen3-Reranker-4B
+  has CPU cold-start headroom. The embedding probe hardcodes 5000ms
+  (`src/commands/models.ts:467`) and the JSDoc admits "the 5s timeout may
+  trip on the very first probe — re-run if so." A local llama-server embed
+  endpoint hits the identical CPU cold-start curve.
+
+  Fix: add optional `default_timeout_ms?: number` to `EmbeddingTouchpoint`
+  in `src/core/ai/types.ts` (sibling to the rerank field), thread through
+  `probeEmbeddingReachability` using the same `recipe.touchpoints.embedding.default_timeout_ms ?? 5000`
+  pattern that the reranker probe uses. Add a regression test in
+  `test/models-doctor-embed.test.ts` pinning the precedence chain.
+
+  Surfaced by the community-PR-wave pre-landing review (informational, no
+  blocker on the wave itself — workaround is "re-run the probe").
+
 ## v0.41.0.0 follow-ups (v0.41.1+)
 
 - [ ] **v0.41+: per-key rate-lease caps (`openai:responses`, `google:gemini`, etc.).**

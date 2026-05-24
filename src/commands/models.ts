@@ -151,7 +151,7 @@ function formatText(report: ModelsReport): string {
     }
   }
   lines.push('');
-  lines.push('Tip: probe reachability with `gbrain models doctor` (opt-in; spends ~1 token per model).');
+  lines.push('Tip: probe reachability with `gbrain models doctor` (opt-in; spends a minimal request per configured chat/embed/rerank surface).');
   return lines.join('\n');
 }
 
