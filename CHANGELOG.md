@@ -2,6 +2,55 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.6.0] - 2026-05-25
+
+**Your PR CI stops taking 23 minutes.** The Test workflow on every pull request was wallclock-bound by one unlucky shard (shard 3, 22-26 min) while other shards finished in 5-13 min. After this release, every shard finishes in roughly the same time, the whole matrix runs in about 9-10 min on a fresh PR, and PRs that don't actually change test-affecting code (rebases, doc-only commits, retries) skip the test run entirely and finish in under 2 minutes via a content-hash cache.
+
+To turn it on: `gbrain upgrade` and pull the new `.github/workflows/test.yml`. First run after the merge writes the cache entry; subsequent matching pushes skip the test matrix.
+
+What you'd see in a concrete example. Pre-this-release: you push a 1-line CHANGELOG typo fix on top of a green PR. CI runs the full 23-minute matrix again. Post-fix: CHANGELOG.md is on the cache-key deny-list, the hash matches your prior green run, every test job skips with the cache-hit signal, the consolidated `Test / test-status` check goes green in under 2 minutes. Same shape for rebases, doc-only PRs, and re-pushes of the same SHA.
+
+How the speedup actually lands. Five orthogonal levers, all in one PR:
+
+1. **Restructured `test.yml` jobs.** `verify` (the 20 pre-test grep guards + typecheck + admin-build), `serial-tests`, and the test matrix used to all run on shard 1 via `if: matrix.shard == 1`, which is why shard 1 was the second-slowest. Each now runs in its own GitHub Actions runner in parallel. Shard 1 becomes equal in size to shards 2-6.
+2. **Matrix 4 → 6 shards.** Six (not eight) keeps total per-PR job count under the GitHub free-tier ~20-job concurrency budget when multiple PRs land same day (6 shards + verify + serial + gitleaks + cache-check + cache-write + test-status = ~12 jobs × 2 concurrent PRs = 24, tight but workable; 8 shards × 2 PRs would queue worse).
+3. **Weight-aware sharding (LPT bin-packer).** `scripts/test-shard.sh` used to partition with `(fnv1a(path) % N) + 1` which is weight-blind. The new `scripts/sharding.ts` does longest-processing-time-first greedy bin-packing over measured per-file weights from `scripts/test-weights.json`. Files absent from the JSON fall back to the corpus median, so adding a new test file works immediately without regenerating weights. Real-weight projection on 712 mined weights: every 6-shard estimated at 534s = 8.9 min wallclock.
+4. **Mined CI-log weights, not isolated profiles.** `scripts/mine-shard-weights.ts` scrapes per-file wallclock from `gh run view --log` output (delta between `##[group]test/foo.test.ts:` timestamps within a shard). Free, real-world data, methodologically right (measures CI shard runtime, not per-file cold-start dominantly). Initial `test-weights.json` mined from run `26398061007`.
+5. **Auto SHA cache.** `scripts/ci-cache-hash.sh` computes a deterministic 16-char sha256 over every git-tracked file EXCEPT `CHANGELOG.md`, `TODOS.md`, `README.md`, `LICENSE`, `docs/**/*.md`, `docs/**/*.txt`. CLAUDE.md, AGENTS.md, and `skills/**/*` are deliberately INCLUDED in the hash because tests read them; deny-listing those would create false-pass holes. A `cache-check` job runs first via `actions/cache/restore@v4.2.3` in `lookup-only: true` mode; on hit, every gated job skips and the `test-status` aggregator reports green. A `cache-write` job seals the cache key only after every gated job actually succeeded.
+
+**What we caught and fixed before merging.** Outside-voice (Codex) reviewed the plan and produced four material changes baked into this ship: (a) confirmed `e2e.yml` is fast (3-5 min) and NOT the critical path, validating that targeting `test.yml` is correct; (b) corrected the deny-list to keep CLAUDE.md and AGENTS.md IN the hash (their original deny-listing would have been a real false-pass hole since 8+ test files read them); (c) replaced the original draft's isolated per-file profiling (~57 min run, wrong methodology) with the log-mining approach; (d) added the job restructure (verify/serial split out of shard 1) which was missing from the original plan.
+
+Coverage. 8 CRITICAL false-pass guards pin the hash invalidation contract: `CLAUDE.md` edit → DIFFERENT hash, `AGENTS.md` edit → DIFFERENT hash, `skills/foo/SKILL.md` edit → DIFFERENT hash, `src/core/db.ts` edit → DIFFERENT hash, `test/foo.test.ts` edit → DIFFERENT hash, `package.json` edit → DIFFERENT hash, `bun.lock` edit → DIFFERENT hash, `.github/workflows/test.yml` edit → DIFFERENT hash. 7 SAFE deny-list invariants pin the cache-hit contract for genuinely test-irrelevant docs. Plus 9 edge cases (untracked-file excluded, rename detection, new-file-type discovery, deny-list-typo guard, symlinks, locale-stable sort, deterministic, usage errors). 24/24 green in `test/scripts/ci-cache-hash.test.ts`.
+
+### Itemized changes
+
+**New scripts:**
+- `scripts/sharding.ts` (NEW) — Pure TypeScript LPT bin-packer with median fallback. Exports `partition`, `loadWeights`, `computeMedian`, `imbalanceRatio`. Throws `WeightsLoadError` on malformed JSON; runs in O(n log n). Pinned by `test/scripts/sharding.test.ts` (23 cases).
+- `scripts/test-shard.sh` (rewrite) — Thin shell wrapper. Same CLI surface (`--dry-run-list` preserved). Streams the file list to `bun run scripts/sharding.ts` via stdin (avoids argv overflow at 676+ files). Slow files (`*.slow.test.ts`) intentionally INCLUDED in CI matrix — local fast loop excludes them; preserves the v0.26.4 CI-vs-local divergence policy.
+- `scripts/test-weights.json` (NEW) — 712 mined weights from a green master run. Stats: min=0ms, median=30ms, max=359087ms (~6 min outlier), total 3306.3s observed runtime.
+- `scripts/mine-shard-weights.ts` (NEW) — Scrapes `gh run view --log` for per-file timing. Three input modes: `--run <ID>`, `--from-file <PATH>`, or piped from stdin. Stable JSON output (sorted keys) for clean diffs. Pinned by `test/scripts/mine-shard-weights.test.ts` (15 cases).
+- `scripts/run-verify-parallel.sh` (NEW) — Fans out 21 fast checks (privacy/jsonb/source-id/admin-build/typecheck/gateway-routed/etc.) via `& wait`, per-check temp dir log, failure aggregation. 27s sequential → 13s parallel (2x) locally; bigger win in CI is shard 1 deload. Pinned by `test/scripts/run-verify-parallel.test.ts` (6 cases including synthetic failure-surfacing).
+- `scripts/ci-cache-hash.sh` (NEW) — Deterministic 16-char sha256 over `git ls-files -s` minus deny-list. ~40ms on 1891 files (was ~9s with per-file `git hash-object`). Pinned by `test/scripts/ci-cache-hash.test.ts` (24 cases: 8 CRITICAL false-pass guards + 7 SAFE deny-list invariants + 9 edge cases).
+
+**Workflow restructure:**
+- `.github/workflows/test.yml` — Seven jobs replacing the old 5-shard layout: `cache-check` (runs first via `actions/cache/restore@v4.2.3` `lookup-only`), then `gitleaks` + `verify` + `serial-tests` + `test` (6-shard matrix) all gated on `if: needs.cache-check.outputs.hit != 'true'`, then `cache-write` (post-all-pass via `if: success() && ...`), then `test-status` (the user-visible aggregator, `if: always()` so it reports green on cache-hit OR all-jobs-pass).
+
+**Coverage extensions:**
+- `test/scripts/test-shard.slow.test.ts` (EXTENDED) — New LPT balance contract: 4-shard and 6-shard wallclock imbalance ratio ≤1.5 with real weights from `test-weights.json`. New INCLUDE-slow-files regression guard. New determinism check. Old FNV-1a runtime tests removed (sharding now lives in TS).
+- `test/privacy-script-wired.test.ts` (FIXED in same wave) — Updated to follow the verify-script indirection (`package.json` `verify` → `run-verify-parallel.sh` → CHECKS array contains `check:privacy`). The original substring assertion broke when the `&&` chain was replaced with the parallel dispatcher.
+
+### For contributors
+
+To regenerate `scripts/test-weights.json` after the corpus drifts significantly:
+
+```bash
+LATEST_RUN=$(gh run list --workflow=test.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+bun run scripts/mine-shard-weights.ts --run "$LATEST_RUN"
+git add scripts/test-weights.json && git commit -m "chore: refresh test weights from CI run $LATEST_RUN"
+```
+
+There is no scheduled regen — weights drift gracefully (missing files fall back to median), so this is opt-in when a specific shard starts feeling slow.
+
 ## [0.41.5.0] - 2026-05-24
 
 **Six community bug-fix PRs land + the E2E suite stops lying about itself.** A fix-wave triage swept the 333-PR queue, closed 10 PRs as already-shipped (with credit, naming the commits + files), and bundled 6 real fixes from the community into one collector. Plus three E2E-suite reliability fixes that surfaced while getting the full Docker suite to 100% green.
