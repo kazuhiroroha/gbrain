@@ -1,5 +1,51 @@
 # TODOS
 
+## v0.42.0.0 onboard wave follow-ups (v0.42.1+)
+
+- **TODO-A (P2)**: Pack-aware `linkable: boolean` per-type field on schema-pack
+  manifests. Both `gbrain extract links --by-mention` and `--ner` would consult
+  it to gate which entity types participate in gazetteer construction. Currently
+  uses a hardcoded `['person', 'company', 'organization', 'entity']` list.
+
+- **TODO-B (P3)**: LLM-based entity disambiguation for `--ner`. v0.42.0 ships
+  regex+gazetteer only; misses cases like "Anthropic's founders" → `Anthropic`
+  link. A small Haiku post-pass would catch these.
+
+- **TODO-C (P3)**: `gbrain onboard --explain <recommendation_id>` drill-down.
+  Shows the underlying check, its measurement, and why the recommendation
+  fired. Useful when an operator wants to understand what `onboard --auto` is
+  about to do.
+
+- **TODO-D (P2)**: Live-brain impact measurement against a representative brain
+  (165K-page production class). v0.42.0 ships the `migration_impact_log`
+  infrastructure; we need real-world numbers to update the design doc claims
+  with measured deltas.
+
+- **TODO-E (P1)**: 100+-case eval suite for takes-bootstrap classifier. v0.42.0
+  ships the classifier + the 20-case eval scaffold per A24. Autopilot tier for
+  takes-bootstrap STAYS `manual_only` until this lands. Required before any
+  autopilot run of takes extraction.
+
+- **TODO-F (P3)**: Web UI surface for `gbrain onboard` recommendations in the
+  admin SPA. Linear-style dashboard with one-click apply.
+
+- **TODO-G (P2)**: Full DATABASE_URL-gated E2E for onboard. v0.42.0 ships
+  hermetic PGLite contracts coverage in `test/e2e/onboard-full-flow.test.ts`;
+  the real-Postgres version needs the Minion worker test harness to land its
+  per-handler stub seam so individual extraction handlers can be replaced for
+  testing.
+
+- **TODO-H (P2)**: `minion_jobs.client_id` schema column. v0.42.0 stores the
+  originating OAuth client_id on `job.data.client_id` (JSONB passthrough).
+  A real schema column + index would let the spend query path (per-client
+  daily cap enforcement) avoid the JSONB projection cost.
+
+- **TODO-I (P3)**: Thin-client (doctor-remote.ts) parity for the 4 new onboard
+  checks (embed_staleness, entity_link_coverage, timeline_coverage,
+  takes_count). Today the MCP run_onboard op runs these server-side via
+  runAllOnboardChecks; doctor-remote.ts would surface them on the thin-client
+  dashboard for operators who only hit the brain via MCP.
+
 ## v0.41.14.0 #1451 drift-fix follow-ups (v0.42+)
 
 - [ ] **v0.42+: refactor `runRoutingEval` to take `ResolverEntry[]` directly** instead of `resolverContent: string`. Cleaner shape than synthesizing markdown then re-parsing it. Cascades through 9+ test files that depend on the string-content API. Defer until the next big refactor of the routing-eval module so the test-file churn lands with that wave.

@@ -2,6 +2,117 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.0.0] - 2026-05-26
+
+**You can now run one command and have gbrain tell you exactly what's
+wrong with your brain — and offer to fix it.**
+
+Most agents wire up gbrain, import their notes, and never realize that
+most of their pages have no inbound links, thousands of pages are
+missing embeddings, and the brain is running at half its retrieval
+potential. The agent doesn't know to ask. The user doesn't know to
+look. This release adds the surface that closes that gap.
+
+Run `gbrain onboard --check` and your brain shows up: how many stale
+chunks, how much entity-link coverage, how many timeline entries, how
+many takes. Then it shows the commands that would fix each one. Run
+`gbrain onboard --auto --max-usd 5` and gbrain runs every fix that's
+safe to apply unattended.
+
+What you can do that you couldn't before:
+
+- `gbrain onboard --check` — see your brain's onboarding state in 5
+  seconds (orphans, stale embeddings, link coverage, timeline coverage,
+  takes count). JSON envelope shape is stable (`schema_version: 1`) for
+  agents that want to bind to it.
+- `gbrain onboard --auto --max-usd 5` — apply every safe remediation
+  the planner returns. Refuses without `--max-usd` so a cron can't burn
+  through your API budget.
+- `gbrain embed --stale --catch-up --priority recent` — embed your
+  newest-edited pages first, keep going until the backlog is gone.
+  Lifts the prior hardcoded 2000-row batch cap (now `--batch-size N`).
+- `gbrain extract links --ner` — typed NER links via your schema pack's
+  `link_types[].inference.regex`. Pairs with `--by-mention` in one walk
+  (shared gazetteer). New `link_kind='typed_ner'` column distinguishes
+  verb-pattern matches from plain mentions without splitting
+  `link_source`.
+- `gbrain extract timeline --from-meetings` — walks meeting pages,
+  writes a timeline entry on each entity that was discussed (attendees
+  + body mentions). Survives the v99 dedup widening so two meetings on
+  the same date no longer silently drop one.
+- `gbrain takes extract --from-pages` — Haiku classifier over your
+  concept/atom/lore/briefing/writing/originals pages, lifts gradeable
+  claims into the takes fence. Two-gate opt-in
+  (`takes.bootstrap_enabled=true` AND `--yes`) — does not run unattended,
+  does not run without your explicit consent.
+- Init + upgrade nudges — `gbrain init` and `gbrain upgrade` now end
+  with a one-line summary of opportunities so first-day users
+  discover the onboard surface. 3-second wallclock cap, fail-open
+  (never crashes init). Suppress with `GBRAIN_NO_ONBOARD_NUDGE=1`.
+- Autopilot tick consults onboard recommendations alongside
+  brain-score remediations. Self-improving brain on a 24h cycle.
+- MCP op `run_onboard` (admin scope) — federated and thin-client
+  installs can probe brain health + drive remediation over OAuth.
+  LLM-bearing handlers (synthesize, patterns, consolidate,
+  takes-bootstrap) require a NEW `run_protected_onboard` scope IN
+  ADDITION to admin — admin alone won't burn your API budget.
+- `gbrain onboard --history` — see what landed and what it changed.
+  New `migration_impact_log` table with full attribution columns
+  (job_id, source_id, brain_id, started_at, idempotency_key)
+  prevents concurrent runs misattributing deltas.
+
+The architecture story for engineers: `gbrain doctor --remediate`
+(v0.36.4.0) had already shipped the cathedral — generalized
+RemediationStep, dependency-ordered execution, BudgetTracker
+integration, Minion-handler dispatch. We extended that cathedral
+instead of building a parallel one. A new
+`src/core/remediation/` library extracts the orchestrator from
+doctor's CLI shape; `gbrain onboard` is a ~180-line wrapper. The
+codex review caught this — the original plan was going to rebuild
+RemediationStep under a new name and that would have been a 4000+
+LOC rebuild of work that already existed.
+
+Schema additions:
+- v98 — `links.link_kind` nullable column (`'plain'` | `'typed_ner'` | NULL).
+- v99 — `timeline_entries` dedup widened to `(page_id, date, summary,
+  source)` so meeting provenance survives.
+- v100 — `migration_impact_log` table + `content_chunks_stale_idx`
+  partial (supports `--priority recent` cursor).
+
+Engine API additions:
+- `BrainEngine.listStaleChunks(opts)` gains `orderBy: 'page_id' |
+  'updated_desc'` + `afterUpdatedAt` for composite-cursor pagination.
+- `BrainEngine.executeRaw(sql, params, opts?)` gains `opts.signal`
+  for real AbortSignal-bound query cancellation (Postgres
+  `query.cancel()`; PGLite best-effort via Promise.race).
+- `LinkBatchInput.link_kind?: string` — threaded through both engine
+  impls' `addLinksBatch` unnest tuple.
+
+Privacy + consent posture: takes-bootstrap sends concept/atom/lore/
+briefing/writing/originals page content to your configured chat model.
+Two-gate consent — `takes.bootstrap_enabled=true` config AND `--yes`
+flag — refuses to run otherwise. Even with both gates flipped, the
+autopilot path for takes-bootstrap stays `manual_only` (does not fire
+unattended) until v0.42.1 lands the 100+-case eval suite.
+
+To take advantage of v0.42.0.0:
+
+`gbrain upgrade` runs the schema migrations and prints the post-upgrade
+banner pointing at `gbrain onboard --check`. If something looks off:
+
+1. Run `gbrain apply-migrations --yes` to ensure v98/v99/v100 landed.
+2. Run `gbrain onboard --check` to see your brain's state.
+3. If you want to opt into takes-bootstrap, run:
+   `gbrain config set takes.bootstrap_enabled true`
+   then `gbrain takes extract --from-pages --yes --max-usd 5`.
+4. Filed an issue? Include `gbrain doctor --json` + the contents of
+   `~/.gbrain/upgrade-errors.jsonl` if it exists. Helps gbrain
+   maintainers find fragile upgrade paths.
+
+Closes meta-issue #1383 (`gbrain onboard`). Migration #1 (auto-link
+`--by-mention`) shipped earlier as v0.41.10.0. PR #1409 (the
+consolidated design doc) is implemented by this release.
+
 ## [0.41.14.0] - 2026-05-25
 
 **Your gbrain skills can declare their own routing triggers in their
