@@ -13,19 +13,25 @@ import { extractFactsFromTurn } from '../src/core/facts/extract.ts';
 
 let engine: PGLiteEngine;
 
-// 30s hook timeout — when this file runs deep in a shard process that's
-// already created ~20 PGLite engines, the WASM cold-start + 95 migrations
-// on a fresh DB legitimately exceeds bun's 5s hook default. CI shard 4
-// hit this on v0.41.17.0 (95 migrations × 21 files × 1 bun process).
+// 60s hook timeout — when this file runs deep in a shard process that's
+// already created ~20 PGLite engines, the WASM cold-start + the full
+// migration chain on a fresh DB legitimately exceeds bun's 5s hook default.
+// CI shard 4 hit this on v0.41.17.0 (95 migrations × 21 files × 1 bun
+// process) and the budget was bumped to 30s. The chain is now 111
+// migrations (retrieval-cathedral added page_aliases + telemetry on top of
+// the v0.41.31/.32 columns), so the 30s budget was again too tight under
+// load — only the engine-dependent put_page tests in this file failed in
+// CI shard 2 (the engine-free extractFactsFromTurn tests passed), the
+// signature of a partially-failed init. Bumped to 60s.
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-}, 30_000);
+}, 60_000);
 
 afterAll(async () => {
   await engine.disconnect();
-}, 30_000);
+}, 60_000);
 
 describe('anti-loop dream_generated marker', () => {
   test('extractFactsFromTurn skips when isDreamGenerated:true', async () => {

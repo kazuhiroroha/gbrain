@@ -206,6 +206,7 @@ export function renderMetricGlossaryMarkdown(): string {
 
   const groups: Array<[string, string[]]> = [
     ['Retrieval Metrics', ['precision@k', 'recall@k', 'mrr', 'ndcg@k']],
+    ['Retrieval-Quality / Evidence Metrics (NamedThingBench)', ['hit@1', 'hit@3', 'avg_rank1_score', 'create_safety']],
     ['Set-Similarity / Stability Metrics', ['jaccard@k', 'top1_stability']],
     ['Statistical-Significance Metrics', ['p_value', 'confidence_interval']],
     ['Operational / Cost Metrics', ['cache_hit_rate', 'avg_results', 'avg_tokens', 'cost_per_query_usd', 'p99_latency_ms']],
