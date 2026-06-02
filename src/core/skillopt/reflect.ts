@@ -52,6 +52,11 @@ export interface ReflectOpts {
   /** Rejected-edit buffer for anti-bias context. */
   rejected: readonly RejectedEntry[];
   optimizerModel: string;
+  /**
+   * Ablation (cat31 config B): 'failure-only' skips the D7 success-reflect call
+   * entirely (even when successes are present). Default 'both' (paper-faithful).
+   */
+  reflectMode?: 'both' | 'failure-only';
   /** Test seam — substitute for gateway.chat. */
   chatFn?: typeof gatewayChat;
   abortSignal?: AbortSignal;
@@ -84,11 +89,61 @@ export async function runReflect(opts: ReflectOpts): Promise<ReflectResult> {
   const failureEdits = opts.failures.length > 0
     ? await callReflect('failure', opts, FAILURE_REFLECT_SYSTEM, opts.failures, usage, errors)
     : [];
-  const successEdits = opts.successes.length > 0
+  // Ablation: 'failure-only' skips the success-reflect call regardless of data.
+  const successEdits = opts.reflectMode !== 'failure-only' && opts.successes.length > 0
     ? await callReflect('success', opts, SUCCESS_REFLECT_SYSTEM, opts.successes, usage, errors)
     : [];
 
   return { failureEdits, successEdits, usage, errors };
+}
+
+const ONE_SHOT_REWRITE_SYSTEM = `You are SkillOpt's optimizer in ONE-SHOT REWRITE mode. Given a SKILL document body and a batch of agent rollouts (some failing, some succeeding), rewrite the ENTIRE body ONCE to make the agent succeed more often.
+
+Output ONLY the rewritten skill body as markdown — no JSON, no code fence, no preamble, no commentary. Do NOT include or modify the YAML frontmatter (it is not shown to you and is out of scope). Keep the same general structure and headings unless a change clearly helps; be surgical, not verbose.`;
+
+export interface OneShotRewriteResult {
+  /** The rewritten skill body (frontmatter NOT included — caller re-attaches). */
+  newBody: string;
+  usage: ReflectResult['usage'];
+  /** Set when the rewrite call errored (caller treats as "no change"). */
+  error?: string;
+}
+
+/**
+ * Ablation baseline (cat31 config C): a single LLM rewrite of the whole skill
+ * body, no optimization loop and no validation gate. A real method (one-shot
+ * prompt rewrite) — the honest "do you even need the loop?" comparison. Runs
+ * through the SAME apply/score path as the loop (the orchestrator feeds the
+ * returned body to the gate), so the comparison is apples-to-apples.
+ */
+export async function runOneShotRewrite(opts: ReflectOpts): Promise<OneShotRewriteResult> {
+  const usage = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 };
+  const chat = opts.chatFn ?? gatewayChat;
+  const userMsg = buildReflectUserMessage(opts.skillBodyText, [...opts.failures, ...opts.successes], opts.rejected);
+  try {
+    const result = await chat({
+      model: opts.optimizerModel,
+      system: ONE_SHOT_REWRITE_SYSTEM,
+      messages: [{ role: 'user', content: userMsg }],
+      maxTokens: 4096,
+      cacheSystem: true,
+      abortSignal: opts.abortSignal,
+    });
+    usage.input_tokens += result.usage.input_tokens;
+    usage.output_tokens += result.usage.output_tokens;
+    usage.cache_read_tokens += result.usage.cache_read_tokens;
+    usage.cache_creation_tokens += result.usage.cache_creation_tokens;
+    // Unwrap a fence ONLY when the model wrapped the ENTIRE response in one
+    // (anchored ^```...```$). A non-anchored match would truncate a legitimate
+    // body that contains a code sample down to just that first fenced block.
+    const trimmed = result.text.trim();
+    const wholeFence = trimmed.match(/^```(?:markdown)?\s*\n([\s\S]*)\n```$/i);
+    const newBody = (wholeFence ? wholeFence[1]! : trimmed).trim();
+    return { newBody, usage };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { newBody: '', usage, error: `one_shot_rewrite_failed: ${msg}` };
+  }
 }
 
 async function callReflect(

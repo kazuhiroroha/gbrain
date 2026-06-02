@@ -120,6 +120,43 @@ export async function runValidationGate(opts: ValidateGateOpts): Promise<GateRes
   return { accepted, perTaskMedians, selScore, scoredRollouts, ...(reason ? { reason } : {}) };
 }
 
+export interface ScoreOnTasksOpts {
+  engine: BrainEngine;
+  skillText: string;
+  tasks: BenchmarkTask[];
+  targetModel: string;
+  judgeModel?: string;
+  /** Median-of-N runs per task. Defaults to `VALIDATION_RUNS_PER_TASK` (3). */
+  runsPerTask?: number;
+  abortSignal?: AbortSignal;
+  rolloutFn?: typeof runRollout;
+  scoreFn?: typeof scoreTrajectory;
+}
+
+/**
+ * Score a skill on an arbitrary task set and return the mean-of-per-task-medians
+ * (`selScore`). The single primitive for "how good is this skill on these tasks?"
+ * — used by the orchestrator's baseline + final-test eval, the held-out gate, and
+ * the Track B eval harnesses, so they can't drift on scoring semantics. Thin
+ * wrapper over `runValidationGate({ bestScore: -1 })` (any score "accepts"; we
+ * only read `.selScore`).
+ */
+export async function scoreSkillOnTasks(opts: ScoreOnTasksOpts): Promise<number> {
+  const gate = await runValidationGate({
+    engine: opts.engine,
+    candidateSkillText: opts.skillText,
+    selSet: opts.tasks,
+    bestScore: -1,
+    targetModel: opts.targetModel,
+    ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
+    ...(opts.runsPerTask !== undefined ? { runsPerTask: opts.runsPerTask } : {}),
+    ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
+    ...(opts.rolloutFn ? { rolloutFn: opts.rolloutFn } : {}),
+    ...(opts.scoreFn ? { scoreFn: opts.scoreFn } : {}),
+  });
+  return gate.selScore;
+}
+
 /** Pure median for an array of numbers. Returns 0 for empty array. */
 export function median(values: readonly number[]): number {
   if (values.length === 0) return 0;
