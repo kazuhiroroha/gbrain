@@ -9,8 +9,17 @@ installSigchldHandler();
 import { installSignalHandlers as installCleanupSignalHandlers } from './core/process-cleanup.ts';
 installCleanupSignalHandlers();
 
-import { readFileSync } from 'fs';
-import { loadConfig, loadConfigWithEngine, toEngineConfig, isThinClient } from './core/config.ts';
+import { readFileSync, existsSync, unlinkSync } from 'fs';
+import { spawn } from 'child_process';
+import {
+  readUpdateCache,
+  isCacheFresh,
+  readSnooze,
+  isSnoozeActive,
+  resolveSelfUpgradeMode,
+  justUpgradedPath,
+} from './core/self-upgrade.ts';
+import { loadConfig, loadConfigFileOnly, loadConfigWithEngine, toEngineConfig, isThinClient } from './core/config.ts';
 import type { GBrainConfig } from './core/config.ts';
 import type { AIGatewayConfig } from './core/ai/types.ts';
 import type { BrainEngine } from './core/engine.ts';
@@ -35,7 +44,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'status', 'connect', 'skillopt']);
+const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'status', 'connect', 'skillopt', 'self-upgrade']);
 // CLI-only commands whose handlers print their own --help text. These are
 // excluded from the generic short-circuit so detailed per-command and
 // per-subcommand usage stays reachable.
@@ -57,6 +66,8 @@ const CLI_ONLY_SELF_HELP = new Set([
   // runCapture saw --help. brainstorm + lsd were already in the set;
   // capture was the holdout.
   'capture',
+  // v0.42 self-upgrade ships its own usage (flags + the agent-skill story).
+  'self-upgrade',
   // v0.37 fix wave (Lane D.4 + CDX2-12): sync's --no-embed flag was
   // unreachable via help because the dispatcher's generic CLI-only
   // short-circuit fired before runSync could print its own usage block.
@@ -79,6 +90,88 @@ const CLI_ONLY_SELF_HELP = new Set([
   // runConnect; route around the generic one-line short-circuit.
   'connect',
 ]);
+
+// v0.42 self-upgrade: commands that must NOT trigger the startup update-check
+// (they ARE the update path, or are trivial/no-DB) and which set
+// GBRAIN_SKIP_STARTUP_HOOKS for any children they spawn.
+const STARTUP_HOOK_SKIP_COMMANDS = new Set([
+  'upgrade', 'post-upgrade', 'check-update', 'self-upgrade',
+]);
+
+/**
+ * Emit the self-upgrade marker on the hot path. CACHE-READ-ONLY: a statSync +
+ * read, sub-ms. On a stale/missing cache it kicks a DETACHED, single-flighted
+ * `gbrain check-update --refresh-cache` and emits nothing this run. NEVER
+ * blocks a command and NEVER throws (the marker must not break any command).
+ * Mode resolution is file-plane only (no DB; thin clients have no local DB).
+ */
+function maybeEmitUpdateMarker(command: string): void {
+  try {
+    if (process.env.GBRAIN_SKIP_STARTUP_HOOKS) return;
+    // Never run during the test suite: tests spawn the CLI hundreds of times,
+    // each with a fresh (stale-cache) GBRAIN_HOME, which would otherwise fire a
+    // detached `gbrain check-update --refresh-cache` per invocation and saturate
+    // the machine with real network calls. Bun sets NODE_ENV=test.
+    if (process.env.NODE_ENV === 'test') return;
+    if (STARTUP_HOOK_SKIP_COMMANDS.has(command)) {
+      // We ARE the update path — skip self-check AND mark children so any
+      // `gbrain post-upgrade` / `gbrain features` they spawn don't re-enter.
+      process.env.GBRAIN_SKIP_STARTUP_HOOKS = '1';
+      return;
+    }
+    if (getCliOptions().quiet) return;
+
+    // JUST_UPGRADED: one-time confirmation after an upgrade (any mode).
+    try {
+      const jpath = justUpgradedPath();
+      if (existsSync(jpath)) {
+        const from = String(readFileSync(jpath, 'utf8')).trim();
+        if (from) process.stderr.write(`JUST_UPGRADED ${from} ${VERSION}\n`);
+        unlinkSync(jpath);
+      }
+    } catch {
+      /* ignore */
+    }
+
+    const cfg = loadConfigFileOnly();
+    const mode = resolveSelfUpgradeMode(cfg);
+    if (mode === 'off') return;
+
+    const now = Date.now();
+    const entry = readUpdateCache();
+    if (entry && isCacheFresh(entry, now)) {
+      if (entry.marker.kind === 'upgrade_available' && entry.marker.latest) {
+        // notify mode honors a per-version snooze; auto mode ignores it.
+        if (mode === 'notify' && isSnoozeActive(readSnooze(), entry.marker.latest, now)) return;
+        process.stderr.write(`UPGRADE_AVAILABLE ${entry.marker.current} ${entry.marker.latest}\n`);
+        process.stderr.write(
+          `gbrain ${entry.marker.current} -> ${entry.marker.latest} available. Run: gbrain self-upgrade\n`,
+        );
+      }
+      return;
+    }
+
+    // Stale/missing cache → kick a detached, single-flighted refresh. The child
+    // (`check-update --refresh-cache`) single-flights via the refresh lock and
+    // writes the cache for the NEXT invocation. We never wait on it.
+    try {
+      const child = spawn('gbrain', ['check-update', '--refresh-cache'], {
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env, GBRAIN_SKIP_STARTUP_HOOKS: '1' },
+      });
+      // ChildProcess is an EventEmitter — an unhandled 'error' (e.g. ENOENT when
+      // gbrain isn't on PATH) would throw uncaught. Swallow it; the refresh is
+      // best-effort.
+      child.on('error', () => {});
+      child.unref();
+    } catch {
+      /* gbrain not on PATH / spawn failed — fail-open, no refresh this run */
+    }
+  } catch {
+    /* the update marker must never break a command */
+  }
+}
 
 async function main() {
   // Parse global flags (--quiet / --progress-json / --progress-interval)
@@ -105,6 +198,11 @@ async function main() {
     printToolsJson();
     return;
   }
+
+  // v0.42 self-upgrade: ride this invocation as an update heartbeat. Cache-read-
+  // only, fail-open, never blocks. Skips the update path's own commands + sets
+  // GBRAIN_SKIP_STARTUP_HOOKS for their children. Runs for every real command.
+  maybeEmitUpdateMarker(command);
 
   const subArgs = args.slice(1);
 
@@ -930,6 +1028,11 @@ async function handleCliOnly(command: string, args: string[]) {
   if (command === 'check-update') {
     const { runCheckUpdate } = await import('./commands/check-update.ts');
     await runCheckUpdate(args);
+    return;
+  }
+  if (command === 'self-upgrade') {
+    const { runSelfUpgrade } = await import('./commands/self-upgrade.ts');
+    await runSelfUpgrade(args);
     return;
   }
   if (command === 'integrations') {
