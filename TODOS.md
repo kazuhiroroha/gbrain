@@ -1,5 +1,26 @@
 # TODOS
 
+## v0.42.15.0 isTTY-output follow-ups (v0.42+)
+
+Filed from the v0.42.15.0 wave (#1784, decouple primary output from
+`process.stdout.isTTY`). Both are the same axis-conflation class the wave fixed
+but were deliberately scoped OUT — neither is a #1784 regression.
+
+- [ ] **P2 — `sync.ts:2491` emits a JSON cost-refusal even without `--json`.** The
+  `gbrain sync --all` cost gate has the byte-identical pattern that
+  `reindex-code.ts:457` had before #1784: non-TTY or `--json` → JSON envelope +
+  exit 2, conflating "refuse to spend" with "machine-readable output." The
+  refusal should be human text unless `--json` is explicit. Out of scope for
+  #1784 because the sync cost-gate is documented as intentional in CLAUDE.md and
+  deserves its own deliberate change. Fix: mirror the extracted
+  `buildCostRefusal({json, ...})` helper (`reindex-code.ts`). The guardrail
+  (exit 2, no spend) stays; only the FORMAT splits on `--json`.
+- [ ] **P3 — `gbrain jobs --help` has no subcommand list.** jobs.ts dispatches
+  on a bare subcommand string with no HELP const, so `watch` (and every other
+  jobs subcommand) is undocumented in `--help`. The new `watch` `--json` /
+  `--follow` flags are documented only in the file JSDoc. Add a HELP table to the
+  `jobs` command listing every subcommand + its flags.
+
 ## v0.42.12.0 self-upgrade follow-ups (v0.43+)
 
 Filed from the self-upgrading-gbrain wave. All deliberately scoped OUT (D7a/D7b

@@ -2,6 +2,42 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.15.0] - 2026-06-02
+
+**Commands print real data when you run them from a subagent, a pipe, or cron, not just when you have a terminal.** A handful of gbrain commands quietly changed what they printed based on whether a terminal was attached. Run them from a coding agent, a `| cat` pipe, or a cron job and you'd get JSON when you wanted human text, or nothing useful at all. The read commands (`get`, `list`, `search`, `query`) were already fine; this fixes the ones that weren't.
+
+The clearest case was `gbrain jobs watch`. In a terminal you got the live dashboard; piped or from a subagent you got an endless stream of JSON with no way to a human view. Now the rule is simple and the same for every command: **human output by default, JSON only when you pass `--json`.** A terminal still controls cosmetics (the live cursor-managed dashboard, colors), never the data.
+
+```
+gbrain jobs watch                 # terminal: live dashboard. piped: one human snapshot, then exits.
+gbrain jobs watch --json          # one JSON snapshot (machine-readable)
+gbrain jobs watch --follow        # stream continuously (human, or JSONL with --json)
+```
+
+`jobs watch` split into two independent knobs: `--json` picks the format, `--follow` picks the cadence. Non-interactive runs print one snapshot and exit (clean for capture), so a subagent that just wants the current queue state gets it in one shot instead of a loop it has to kill.
+
+### What else changed
+
+- **`gbrain reindex --code` refusal is now readable.** When it declines to spend money re-embedding without `--yes` in a non-interactive shell, it now prints a plain-English refusal instead of a JSON error blob (JSON only with `--json`). The safety behavior is unchanged: it still refuses and exits 2 rather than spending unconfirmed.
+- **The eval commands stop hiding why they did less work.** `gbrain eval cross-modal` and `gbrain eval takes-quality` run fewer cycles non-interactively (a deliberate cost guard). They already printed the cycle count; now the line says *why* it's low and how to change it: `cycles: 1 (non-interactive default; --cycles N for more)`. Same for the `$1` budget default on `gbrain eval suspected-contradictions` (`--budget-usd N to raise`).
+
+Nothing here changes a TTY/interactive session: the live `jobs watch` dashboard, prompts, and your normal terminal output are all identical.
+
+## To take advantage of v0.42.15.0
+
+`gbrain upgrade` is all you need. There's no migration and no schema change.
+
+1. **Update:**
+   ```bash
+   gbrain upgrade
+   ```
+2. **Verify the fix:** run a command non-interactively and confirm you get real output.
+   ```bash
+   gbrain jobs watch </dev/null | cat        # one human snapshot, exits 0
+   gbrain jobs watch --json </dev/null | cat # one JSON line
+   ```
+3. **If you scripted `gbrain jobs watch` for a JSON stream non-interactively,** add `--json --follow` to keep the old streaming behavior. (For scripting, `gbrain jobs stats --json` / `gbrain jobs list --json` remain the cleaner surfaces.)
+4. **If anything looks wrong,** file an issue at https://github.com/garrytan/gbrain/issues with the command you ran and what you saw.
 ## [0.42.14.0] - 2026-06-02
 
 **Two zero-config gaps closed: code-* queries now tell you whether the graph is built, and `gbrain init` tells you up front when your embedding key is missing.**
