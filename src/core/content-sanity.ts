@@ -376,14 +376,18 @@ export function assessContentSanity(opts: {
   // doesn't repeat the lowercase per literal.
   const bodyHead = body.slice(0, SCAN_HEAD_BYTES);
   const bodyHeadLower = bodyHead.toLowerCase();
-  const titleLower = opts.title.toLowerCase();
+  // Belt-and-suspenders (#1883/#1658): the parser already coerces a non-string
+  // frontmatter title, but any caller passing an unsanitized non-string title
+  // would otherwise crash `.toLowerCase()` and abort the whole lint/sync run.
+  const titleStr = typeof opts.title === 'string' ? opts.title : String(opts.title ?? '');
+  const titleLower = titleStr.toLowerCase();
 
   const junk_pattern_matches: string[] = [];
   for (const p of BUILT_IN_JUNK_PATTERNS) {
     const scope = p.applies_to ?? 'both';
     let matched = false;
     if (scope === 'title' || scope === 'both') {
-      if (p.pattern.test(opts.title)) matched = true;
+      if (p.pattern.test(titleStr)) matched = true;
     }
     if (!matched && (scope === 'body' || scope === 'both')) {
       if (p.pattern.test(bodyHead)) matched = true;
