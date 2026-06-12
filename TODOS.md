@@ -23,6 +23,24 @@ are the bar). Plan + GSTACK REVIEW REPORT at
   string window (`user:`/`assistant:` prefixes) to avoid a dual-shape contract.
   If MCP callers accumulate parsing bugs, add a structured array param beside it.
   **Where:** `src/core/operations.ts:volunteer_context` + `src/core/context/volunteer.ts:parseWindow`.
+- [ ] **P3 — index shapes for the per-turn resolver query.** The arm-2 resolver
+  (`retrieval-reflex.ts`: `lower(title) = ANY() OR slug = ANY() OR slug LIKE
+  ANY('%/...')`) predates #2095 but now runs per turn on three channels
+  (reflex window, volunteer_context, watch) federated across sources. Neither
+  the leading-wildcard suffix arm nor `lower(title)` is index-served. If
+  per-turn latency telemetry on large brains comes back hot: add
+  `(source_id, lower(title))` btree + a reverse(slug) text_pattern_ops (or
+  gin_trgm) index, or split the OR into three index-friendly queries.
+  **Where:** `src/core/context/retrieval-reflex.ts`, migration.
+- [ ] **P3 — batch the volunteer-events pruner's first run after a long gap.**
+  `purgeStaleVolunteerEvents` is one unbatched DELETE with a bare
+  `volunteered_at` predicate (full scan; fine for a TTL-bounded table). Edge:
+  a brain whose dream cycle was off for months could hit the pooler's ~2min
+  statement_timeout on the first prune, get swallowed by the catch, and never
+  make progress. If observed: id-batched chunks (`DELETE ... WHERE id IN
+  (SELECT ... LIMIT 10000)` looped). **Where:**
+  `src/core/context/volunteer-events.ts:purgeStaleVolunteerEvents`.
+
 ## gbrain triage wave follow-ups (filed v0.42.41.0)
 
 Deferred from the v0.42.41.0 fix wave (eng-reviewed as separate scope, not hotfixes).

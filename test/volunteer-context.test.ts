@@ -393,3 +393,76 @@ describe('volunteer_context op (contract surface)', () => {
     expect(stats.note).toContain('approximate');
   });
 });
+
+describe('knob clamps — untrusted MCP caller inputs (review hardening)', () => {
+  test('minConfidence outside [0,1] (or NaN) falls back to the 0.7 default gate', async () => {
+    await seed('projects/widget-co', 'The Widget Company Project', 'A project.');
+    const turns = parseWindow('user: updates on Widget-Co?');
+    for (const bad of [5, -1, Number.NaN]) {
+      const pages = await volunteerContext(engine, turns, { sourceIds: ['default'], minConfidence: bad });
+      expect(pages).toEqual([]); // slug-suffix (0.6+boost) stays gated at the default 0.7
+    }
+  });
+
+  test('maxPages 0 / negative / NaN fall back to the 3-page default', async () => {
+    for (let i = 0; i < 5; i++) await seed(`people/person-${i}`, `Person Alpha${i}`, 'A person.');
+    const text = Array.from({ length: 5 }, (_, i) => `Person Alpha${i}`).join(' and ');
+    for (const bad of [0, -3, Number.NaN]) {
+      const pages = await volunteerContext(engine, parseWindow(`user: intro ${text}`), {
+        sourceIds: ['default'],
+        maxPages: bad,
+      });
+      expect(pages.length).toBeLessThanOrEqual(3);
+      expect(pages.length).toBeGreaterThan(0);
+    }
+  });
+
+  test('stats days <= 0 / NaN falls back to 30', async () => {
+    const stats = await volunteerUsageStats(engine, ['default'], -5);
+    expect(stats.days).toBe(30);
+    const stats2 = await volunteerUsageStats(engine, ['default'], Number.NaN);
+    expect(stats2.days).toBe(30);
+  });
+});
+
+describe('window-cap ordering — the newest user mention survives the cap', () => {
+  test('stale assistant-only chatter is dropped before a newest-turn user entity', async () => {
+    const { extractCandidatesFromWindow: extract, MAX_CANDIDATES: CAP } = await import('../src/core/context/entity-salience.ts');
+    // 14 stale assistant-introduced entities in turn 1, then the user names
+    // ONE entity in the newest turn. The cap (12) must keep the user's.
+    const stale = Array.from({ length: 14 }, (_, i) => `Stale Chatter${i}`).join(', ');
+    const cands = extract([
+      { role: 'assistant', text: `consider ${stale}.` },
+      { role: 'user', text: 'actually ask Alice Example first' },
+    ]);
+    expect(cands.length).toBeLessThanOrEqual(CAP);
+    const alice = cands.find((c) => normalizeAlias(c.query) === normalizeAlias('Alice Example'));
+    expect(alice).toBeDefined();
+    // Recency + user-role weighting puts the newest user mention FIRST.
+    expect(normalizeAlias(cands[0].query)).toBe(normalizeAlias('Alice Example'));
+  });
+});
+
+describe('volunteer-events sink — timeout branch (long-lived process safety)', () => {
+  test('a hung write reports unfinished and drops the snapshot (no ghost references)', async () => {
+    const {
+      logVolunteerEventsFireAndForget,
+      awaitPendingVolunteerEventWrites,
+      _resetPendingVolunteerEventWritesForTests,
+      _peekPendingVolunteerEventWritesForTests,
+    } = await import('../src/core/context/volunteer-events.ts');
+    _resetPendingVolunteerEventWritesForTests();
+    const hangingEngine = {
+      executeRaw: () => new Promise(() => { /* never settles */ }),
+    } as never;
+    logVolunteerEventsFireAndForget(hangingEngine, [
+      { source_id: 'default', slug: 'people/x', confidence: 0.9, match_arm: 'alias', rationale: 'r', channel: 'watch' },
+    ]);
+    const { unfinished } = await awaitPendingVolunteerEventWrites(20);
+    expect(unfinished).toBe(1);
+    // Snapshot dropped so a long-lived `gbrain watch` never accumulates
+    // references to forever-pending work (the last-retrieved C1 class).
+    expect(_peekPendingVolunteerEventWritesForTests()).toBe(0);
+    _resetPendingVolunteerEventWritesForTests();
+  });
+});

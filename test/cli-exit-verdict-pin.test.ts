@@ -22,8 +22,11 @@ describe('exit-verdict ownership — no raw process.exitCode assignments', () =>
     //    RESTORE around PGlite.create() — it keeps the GLOBAL tidy for
     //    external readers and is explicitly not a verdict write (the owned
     //    channel never reads process.exitCode).
+    // Whitespace/operator-tolerant: catches `process.exitCode=1`,
+    // `process.exitCode ??= 1`, `process.exitCode ||= 1`, and the bracket
+    // form — every shape is equally zeroed by the owned-verdict read.
     const hits = execSync(
-      `grep -rn "process.exitCode = " src --include='*.ts' | grep -v "core/cli-force-exit.ts" | grep -v "core/pglite-engine.ts" || true`,
+      String.raw`grep -rnE "process(\.|\[')exitCode('\])?[[:space:]]*([?|&]{2})?=[^=]" src --include='*.ts' | grep -v "core/cli-force-exit.ts" | grep -v "core/pglite-engine.ts" || true`,
       { encoding: 'utf-8', cwd: new URL('..', import.meta.url).pathname },
     ).trim();
     expect(hits).toBe('');

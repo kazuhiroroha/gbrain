@@ -333,3 +333,70 @@ describe('ambient-channel event logging (codex D11 — logChannel: reflex)', () 
     expect(rows.length).toBe(0);
   });
 });
+
+describe('serve IPC wiring — suppression passthrough + reflex-channel logging (review hardening)', () => {
+  test('the IPC round-trip honors slug-only suppression and logs channel=reflex', async () => {
+    const { startResolveIpcServer, resolveViaIpc, resolveSocketPath, IPC_UNAVAILABLE } =
+      await import('../src/core/context/resolve-ipc.ts');
+    const { awaitPendingVolunteerEventWrites, _resetPendingVolunteerEventWritesForTests } =
+      await import('../src/core/context/volunteer-events.ts');
+    const { mkdtempSync, rmSync } = await import('fs');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+
+    _resetPendingVolunteerEventWritesForTests();
+    await engine.executeRaw('DELETE FROM context_volunteer_events').catch(() => {});
+    await seed('people/alice-example', 'Alice Example', 'A founder.');
+
+    const dir = mkdtempSync(join(tmpdir(), 'rr-ipc-'));
+    const sock = resolveSocketPath(dir);
+    // The SAME handler shape src/mcp/server.ts wires for serve: forwards
+    // suppression from the request and logs on the ambient reflex channel.
+    const server = await startResolveIpcServer(sock, (req) =>
+      resolveEntitiesToPointers(engine, req.sourceId || 'default', req.candidates ?? [], {
+        priorContextText: req.priorContextText,
+        maxPointers: req.maxPointers,
+        suppression: req.suppression,
+        logChannel: 'reflex',
+      }),
+    );
+    expect(server).not.toBeNull();
+    try {
+      // slug-only suppression: a TITLE mention in prior context must NOT
+      // suppress (the windowing contract), and the resolve must log.
+      const block = await resolveViaIpc(sock, {
+        candidates: extractCandidates('tell me about Alice Example'),
+        priorContextText: 'earlier turn merely mentioned Alice Example',
+        suppression: 'slug-only',
+      });
+      expect(block).not.toBe(IPC_UNAVAILABLE);
+      expect(block).not.toBeNull();
+      expect((block as { pointers: Array<{ slug: string }> }).pointers[0].slug).toBe('people/alice-example');
+
+      const { unfinished } = await awaitPendingVolunteerEventWrites(5_000);
+      expect(unfinished).toBe(0);
+      const rows = await engine.executeRaw<{ channel: string }>(
+        'SELECT channel FROM context_volunteer_events', [],
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].channel).toBe('reflex');
+    } finally {
+      server!.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('windowTurnCount — knob edge semantics', () => {
+  test('0, negative, NaN, and absent all fall back to the default of 4 (1 = legacy off)', async () => {
+    const { windowTurnCount, DEFAULT_WINDOW_TURNS } = await import('../src/core/context/reflex.ts');
+    expect(DEFAULT_WINDOW_TURNS).toBe(4);
+    expect(windowTurnCount(null)).toBe(4);
+    expect(windowTurnCount({ retrieval_reflex_window_turns: 0 } as never)).toBe(4);
+    expect(windowTurnCount({ retrieval_reflex_window_turns: -3 } as never)).toBe(4);
+    expect(windowTurnCount({ retrieval_reflex_window_turns: Number.NaN } as never)).toBe(4);
+    // The documented "off" switch is 1 (legacy single-turn), not 0.
+    expect(windowTurnCount({ retrieval_reflex_window_turns: 1 } as never)).toBe(1);
+    expect(windowTurnCount({ retrieval_reflex_window_turns: 6.9 } as never)).toBe(6);
+  });
+});

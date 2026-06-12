@@ -153,3 +153,33 @@ describe('gbrain watch — window + cap flags (ship coverage G4)', () => {
     expect(out.length).toBe(1);
   });
 });
+
+describe('gbrain watch — per-turn fail-open (review hardening)', () => {
+  test('a transient DB error on one turn never kills the stream', async () => {
+    await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');
+    // Fail the FIRST resolver query against pages (turn 1's resolution);
+    // everything else — incl. resolveSourceId's pre-loop check — passes.
+    let pagesQueries = 0;
+    const flaky = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'executeRaw') {
+          return (sql: string, params: unknown[]) => {
+            if (/FROM pages/.test(sql) && ++pagesQueries === 1) {
+              return Promise.reject(new Error('transient db hiccup'));
+            }
+            return target.executeRaw(sql, params);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const out: string[] = [];
+    await runWatch(flaky as never, ['--source', 'default'], {
+      lines: feed(['user: ping Alice Example', 'user: ping Alice Example please']),
+      write: (s) => out.push(s),
+      isTTY: false,
+    });
+    // Turn 1 failed open; turn 2 volunteered. The stream survived.
+    expect(out.join('')).toContain('people/alice-example');
+  });
+});

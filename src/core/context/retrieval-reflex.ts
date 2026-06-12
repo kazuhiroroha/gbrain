@@ -148,16 +148,23 @@ export async function resolveEntitiesToPointers(
   const titlesLc: string[] = [];
   const exactSlugs: string[] = [];
   const slugSuffixes: string[] = [];
+  // Reverse maps for arm-2 provenance (which candidate produced a row) —
+  // populated in this same pass so the derivations happen exactly once.
+  const titleToNorm = new Map<string, string>();
+  const slugToNorm = new Map<string, string>();
   for (const c of candidates) {
     const norm = normalizeAlias(c.query);
     if (!norm) continue;
     if (!displayByNorm.has(norm)) displayByNorm.set(norm, c.display);
     aliasNorms.push(norm);
-    titlesLc.push(c.query.toLowerCase());
+    const tl = c.query.toLowerCase();
+    titlesLc.push(tl);
+    if (!titleToNorm.has(tl)) titleToNorm.set(tl, norm);
     const s = slugify(c.query);
     if (s) {
       exactSlugs.push(s);
       slugSuffixes.push(`%/${s}`);
+      if (!slugToNorm.has(s)) slugToNorm.set(s, norm);
     }
   }
   if (!aliasNorms.length) return null;
@@ -179,31 +186,24 @@ export async function resolveEntitiesToPointers(
       resolved.push({ slug, source_id: src, arm, matchedNorm });
     }
   };
-  // Reverse maps for arm-2 provenance: which CANDIDATE produced this row
-  // (titles/slugs were built per candidate above, in the same pass).
-  const titleToNorm = new Map<string, string>();
-  const slugToNorm = new Map<string, string>();
-  for (const c of candidates) {
-    const norm = normalizeAlias(c.query);
-    if (!norm) continue;
-    const tl = c.query.toLowerCase();
-    if (!titleToNorm.has(tl)) titleToNorm.set(tl, norm);
-    const s = slugify(c.query);
-    if (s && !slugToNorm.has(s)) slugToNorm.set(s, norm);
-  }
-
   // Arm 1 — alias-first. Unambiguous single-slug hits only, per source (no
   // engine-interface change for federation). Guarded: pre-v110 brains throw
   // "relation page_aliases does not exist" — swallow and continue.
-  for (const src of sourceIds) {
-    try {
-      const aliasMap = await engine.resolveAliases(aliasNorms, { sourceId: src });
-      for (const norm of aliasNorms) {
-        const hits = aliasMap.get(norm);
-        if (hits && hits.length === 1) push(hits[0].slug, src, 'alias', norm);
-      }
-    } catch {
-      /* no page_aliases table (pre-v110) — degrade to the title/slug arm */
+  // Per-source lookups are independent — run them concurrently so a
+  // federated caller (M granted sources) pays one RTT, not M sequential
+  // ones (~71ms each cross-region; the reflex runs under a 1.5s budget).
+  // Results are folded back in sourceIds order so pointer ordering stays
+  // deterministic. Per-source failures degrade independently (pre-v110
+  // brains have no page_aliases table).
+  const aliasResults = await Promise.allSettled(
+    sourceIds.map((src) => engine.resolveAliases(aliasNorms, { sourceId: src })),
+  );
+  for (let i = 0; i < sourceIds.length; i++) {
+    const r = aliasResults[i];
+    if (r.status !== 'fulfilled') continue;
+    for (const norm of aliasNorms) {
+      const hits = r.value.get(norm);
+      if (hits && hits.length === 1) push(hits[0].slug, sourceIds[i], 'alias', norm);
     }
   }
 
@@ -288,17 +288,13 @@ export async function resolveEntitiesToPointers(
   // keeps the reflex hot path dependency-free when logging is off.
   if (opts.logChannel) {
     try {
-      const { logVolunteerEventsFireAndForget } = await import('./volunteer-events.ts');
+      const { logVolunteerEventsFireAndForget, volunteerEventRowsFrom } = await import('./volunteer-events.ts');
       logVolunteerEventsFireAndForget(
         engine,
-        pointers.map((p) => ({
-          source_id: p.source_id,
-          slug: p.slug,
-          confidence: p.confidence,
-          match_arm: p.arm,
-          rationale: `${p.arm} match "${p.display}"`,
-          channel: opts.logChannel as 'reflex',
-        })),
+        volunteerEventRowsFrom(
+          pointers.map((p) => ({ ...p, rationale: `${p.arm} match "${p.display}"` })),
+          { channel: opts.logChannel as 'reflex' },
+        ),
       );
     } catch {
       /* telemetry only — never blocks the pointer block */

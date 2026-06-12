@@ -187,14 +187,19 @@ function getLastUserText(messages: AgentMessage[]): string {
  */
 const WINDOW_TURNS_HARD_CAP = 12;
 function getWindowTurns(messages: AgentMessage[]): Array<{ role: 'user' | 'assistant'; text: string }> {
+  // Iterate from the END: this runs on the per-turn hot path (1.5s reflex
+  // budget) and only the last 12 turns matter — flattening every content
+  // block of a multi-hundred-turn session just to slice the tail would make
+  // the cost grow with session length.
   const out: Array<{ role: 'user' | 'assistant'; text: string }> = [];
-  for (const m of messages) {
+  for (let i = messages.length - 1; i >= 0 && out.length < WINDOW_TURNS_HARD_CAP; i--) {
+    const m = messages[i];
     if (m?.role !== 'user' && m?.role !== 'assistant') continue;
     const text = messageText(m.content);
     if (!text) continue;
     out.push({ role: m.role, text });
   }
-  return out.slice(-WINDOW_TURNS_HARD_CAP);
+  return out.reverse();
 }
 
 /**

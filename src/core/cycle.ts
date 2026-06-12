@@ -1287,7 +1287,7 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     }
     // v0.43 (#2095) — 90-day GC of the volunteered-context feedback log.
     // Conversation-adjacent telemetry must never grow unbounded. Best-effort:
-    // purgeStaleVolunteerEvents returns 0 on pre-v116 brains (no table).
+    // purgeStaleVolunteerEvents returns 0 on pre-v117 brains (no table).
     let purgedVolunteerEvents = 0;
     try {
       const { purgeStaleVolunteerEvents } = await import('./context/volunteer-events.ts');

@@ -25,12 +25,15 @@ import { createInterface } from 'node:readline';
 import type { BrainEngine } from '../core/engine.ts';
 import {
   volunteerContext,
+  formatVolunteeredPage,
+  TURN_PREFIX_RE,
   VOLUNTEER_DEFAULT_MAX_PAGES,
   VOLUNTEER_DEFAULT_MIN_CONFIDENCE,
 } from '../core/context/volunteer.ts';
 import type { WindowTurn } from '../core/context/entity-salience.ts';
-import { DEFAULT_WINDOW_TURNS } from '../core/context/reflex.ts';
-import { logVolunteerEventsFireAndForget } from '../core/context/volunteer-events.ts';
+import { DEFAULT_WINDOW_TURNS, windowTurnCount } from '../core/context/reflex.ts';
+import { loadConfig } from '../core/config.ts';
+import { logVolunteerEventsFireAndForget, volunteerEventRowsFrom } from '../core/context/volunteer-events.ts';
 
 export const WATCH_HELP = `gbrain watch — push-based context: volunteer brain pages per conversation turn (#2095)
 
@@ -51,8 +54,6 @@ Flags:
   --source <id>          source scope (defaults to the canonical 6-tier resolution)
   --help                 this text
 `;
-
-const TURN_PREFIX_RE = /^(user|assistant)\s*:\s?(.*)$/i;
 
 function numFlag(args: string[], flag: string): number | undefined {
   const i = args.indexOf(flag);
@@ -80,7 +81,12 @@ export async function runWatch(engine: BrainEngine, args: string[], deps: WatchI
   }
 
   const json = args.includes('--json');
-  const windowTurns = Math.max(1, Math.floor(numFlag(args, '--window-turns') ?? DEFAULT_WINDOW_TURNS));
+  // --window-turns wins; otherwise the same config knob the ambient reflex
+  // honors (retrieval_reflex_window_turns, default 4) applies here too.
+  const windowTurns = Math.max(
+    1,
+    Math.floor(numFlag(args, '--window-turns') ?? windowTurnCount(loadConfig())),
+  );
   const maxPages = numFlag(args, '--max-pages');
   const minConfidence = numFlag(args, '--min-confidence');
   const write = deps.write ?? ((s: string) => process.stdout.write(s));
@@ -91,9 +97,14 @@ export async function runWatch(engine: BrainEngine, args: string[], deps: WatchI
   const sourceIds = [sourceId];
   const sessionId = `watch-${process.pid}-${Date.now().toString(36)}`;
 
-  if (isTTY && !deps.lines) {
+  if (!deps.lines) {
+    // The ready line doubles as a machine-readable readiness signal for
+    // scripted consumers (and the SIGINT lifecycle test): engine + source
+    // resolution are done, the stdin loop starts next.
     process.stderr.write(
-      `[watch] interactive session ${sessionId} — type turns ('assistant: ...' to set role), Ctrl-C to end\n`,
+      isTTY
+        ? `[watch] interactive session ${sessionId} ready — type turns ('assistant: ...' to set role), Ctrl-C to end\n`
+        : `[watch] session ${sessionId} ready\n`,
     );
   }
 
@@ -132,28 +143,21 @@ export async function runWatch(engine: BrainEngine, args: string[], deps: WatchI
           sourceIds,
           maxPages,
           minConfidence,
-          // Already-pushed slugs ride priorContext → the core's slug-only
-          // suppression dedupes for the whole session.
-          priorContext: pushedSlugs.size ? Array.from(pushedSlugs).join('\n') : undefined,
         });
       } catch {
         continue; // fail-open per turn: a transient DB error never kills the stream
       }
+      // Session dedupe via O(1) Set membership — a slug is volunteered at most
+      // once per session. (Feeding pushed slugs back as priorContext would
+      // rebuild + rescan a monotonically growing string every turn: O(T²)
+      // over a long-lived session.)
+      pages = pages.filter((p) => !pushedSlugs.has(p.slug));
       if (!pages.length) continue;
 
       for (const p of pages) pushedSlugs.add(p.slug);
       logVolunteerEventsFireAndForget(
         engine,
-        pages.map((p) => ({
-          source_id: p.source_id,
-          slug: p.slug,
-          confidence: p.confidence,
-          match_arm: p.arm,
-          rationale: p.rationale,
-          channel: 'watch' as const,
-          session_id: sessionId,
-          turn: turnNo,
-        })),
+        volunteerEventRowsFrom(pages, { channel: 'watch', session_id: sessionId, turn: turnNo }),
       );
 
       if (json) {
@@ -162,10 +166,7 @@ export async function runWatch(engine: BrainEngine, args: string[], deps: WatchI
         }
       } else {
         for (const p of pages) {
-          write(
-            `${p.display} → ${p.slug} (${p.confidence.toFixed(2)}, ${p.arm}) — ${p.rationale}` +
-              (p.synopsis ? `\n    ${p.synopsis}` : '') + '\n',
-          );
+          write(formatVolunteeredPage(p) + '\n');
         }
       }
     }

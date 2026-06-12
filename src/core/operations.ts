@@ -3215,19 +3215,19 @@ const volunteer_context: Operation = {
     // volunteer-events sink (drained at exit). Never fails the op.
     if (pages.length) {
       try {
-        const { logVolunteerEventsFireAndForget } = await import('./context/volunteer-events.ts');
+        const { logVolunteerEventsFireAndForget, volunteerEventRowsFrom } = await import('./context/volunteer-events.ts');
+        // Trust-boundary clamps (remote MCP callers): cap session_id length so
+        // a read-scoped token can't bank unbounded TEXT per request, and only
+        // log integer turns — a non-integer would throw inside the single
+        // multi-row INSERT and silently drop the whole batch.
+        const sessionId = typeof p.session_id === 'string' ? p.session_id.slice(0, 256) : null;
+        const turn =
+          typeof p.turn === 'number' && Number.isInteger(p.turn) && Math.abs(p.turn) <= 2_147_483_647
+            ? p.turn
+            : null;
         logVolunteerEventsFireAndForget(
           ctx.engine,
-          pages.map((pg) => ({
-            source_id: pg.source_id,
-            slug: pg.slug,
-            confidence: pg.confidence,
-            match_arm: pg.arm,
-            rationale: pg.rationale,
-            channel: 'op' as const,
-            session_id: typeof p.session_id === 'string' ? p.session_id : null,
-            turn: typeof p.turn === 'number' ? p.turn : null,
-          })),
+          volunteerEventRowsFrom(pages, { channel: 'op', session_id: sessionId, turn }),
         );
       } catch {
         /* telemetry only */

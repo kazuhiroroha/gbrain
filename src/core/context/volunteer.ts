@@ -63,7 +63,9 @@ export interface VolunteerOpts {
   minConfidence?: number;
 }
 
-const TURN_PREFIX_RE = /^(user|assistant)\s*:\s?(.*)$/i;
+/** Shared wire protocol for window turns — watch.ts imports this so the two
+ * channels can never desynchronize on the prefix grammar. */
+export const TURN_PREFIX_RE = /^(user|assistant)\s*:\s?(.*)$/i;
 
 /**
  * Lenient window parser: `user:` / `assistant:` line prefixes start a new
@@ -170,6 +172,18 @@ export async function volunteerContext(
   return out;
 }
 
+/**
+ * Canonical human rendering of one volunteered page — shared by
+ * `gbrain volunteer-context` (cli.ts formatResult) and `gbrain watch` so the
+ * two surfaces can't drift.
+ */
+export function formatVolunteeredPage(p: VolunteeredPage): string {
+  return (
+    `${p.display} → ${p.slug} (${p.confidence.toFixed(2)}, ${p.arm}) — ${p.rationale}` +
+    (p.synopsis ? `\n    ${p.synopsis}` : '')
+  );
+}
+
 // ── Usage stats (the feedback loop) ──────────────────────────────────────
 
 export interface VolunteerArmStats {
@@ -198,7 +212,7 @@ export const VOLUNTEER_STATS_NOTE =
 
 /**
  * Per-arm/channel precision over the last N days, source-scoped. Read-only;
- * returns zeroed stats on pre-v116 brains (no table).
+ * returns zeroed stats on pre-v117 brains (no table).
  */
 export async function volunteerUsageStats(
   engine: BrainEngine,
@@ -222,7 +236,7 @@ export async function volunteerUsageStats(
       [sourceIds, String(safeDays)],
     );
   } catch {
-    rows = []; // pre-v116 brain — table doesn't exist yet
+    rows = []; // pre-v117 brain — table doesn't exist yet
   }
   const by_arm: VolunteerArmStats[] = rows.map((r) => {
     const volunteered = Number(r.volunteered);

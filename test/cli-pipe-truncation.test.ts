@@ -26,7 +26,7 @@ describe('cli pipe completeness — deliberate exit never truncates piped stdout
         env: { ...process.env, GBRAIN_SKIP_STARTUP_HOOKS: '1' },
         maxBuffer: 64 * 1024 * 1024,
       });
-      return { stdout: res.stdout ?? '', status: res.status, ms: Date.now() - t0 };
+      return { stdout: res.stdout ?? '', stderr: res.stderr ?? '', status: res.status, ms: Date.now() - t0 };
     };
     const first = run();
     expect(first.status).toBe(0);
@@ -34,8 +34,11 @@ describe('cli pipe completeness — deliberate exit never truncates piped stdout
     // Truncated JSON does not parse — the strongest single-run completeness check.
     const parsed = JSON.parse(first.stdout);
     expect(Array.isArray(parsed)).toBe(true);
-    // Deliberate exit, not the teardown backstop.
-    expect(first.ms).toBeLessThan(9_000);
+    // Deliberate exit, not the teardown backstop. A wall-clock bound is flaky
+    // on cold CI (bun parse alone runs 10-20s there) — the backstop's banner
+    // is the truthful signal, same assertion the pgbouncer e2e uses.
+    expect(first.stderr).not.toContain('force-exiting');
+    expect(first.stderr).not.toContain('did not return within');
 
     const second = run();
     expect(second.status).toBe(0);

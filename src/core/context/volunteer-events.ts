@@ -13,8 +13,9 @@
  *
  * Retention: rows older than VOLUNTEER_EVENTS_TTL_DAYS are pruned by the
  * dream cycle's purge phase so conversation-adjacent telemetry never grows
- * unbounded. rationale is a deterministic template string, never raw
- * conversation text.
+ * unbounded. rationale is a deterministic template that may embed the matched
+ * entity's surface form (which by construction resolved to an existing
+ * alias/title/slug) — never free conversation text.
  */
 
 import type { BrainEngine } from './../engine.ts';
@@ -23,6 +24,27 @@ import { registerBackgroundWorkDrainer } from '../background-work.ts';
 export const VOLUNTEER_EVENTS_TTL_DAYS = 90;
 
 export type VolunteerChannel = 'op' | 'reflex' | 'watch';
+
+/**
+ * Map volunteered pages to event rows for one channel — the ONE place the
+ * VolunteerEventRow shape is assembled (op / reflex / watch all call this,
+ * so adding a column is a one-site change).
+ */
+export function volunteerEventRowsFrom(
+  pages: Array<{ source_id: string; slug: string; confidence: number; arm: string; rationale: string }>,
+  opts: { channel: VolunteerChannel; session_id?: string | null; turn?: number | null },
+): VolunteerEventRow[] {
+  return pages.map((p) => ({
+    source_id: p.source_id,
+    slug: p.slug,
+    confidence: p.confidence,
+    match_arm: p.arm,
+    rationale: p.rationale,
+    channel: opts.channel,
+    session_id: opts.session_id ?? null,
+    turn: opts.turn ?? null,
+  }));
+}
 
 export interface VolunteerEventRow {
   source_id: string;
@@ -81,7 +103,7 @@ const pendingVolunteerEventWrites = new Set<Promise<unknown>>();
 
 /**
  * Log volunteered pages without blocking the hot path. The batched INSERT
- * runs as a tracked dangling promise; errors are swallowed (pre-v116 brains,
+ * runs as a tracked dangling promise; errors are swallowed (pre-v117 brains,
  * transient DB failures — the volunteer result is unaffected).
  */
 export function logVolunteerEventsFireAndForget(
@@ -140,7 +162,7 @@ export function _peekPendingVolunteerEventWritesForTests(): number {
 
 /**
  * 90-day GC, called from the dream cycle's purge phase (mirrors
- * purgeStaleCheckpoints). Best-effort: returns 0 on any failure (pre-v116
+ * purgeStaleCheckpoints). Best-effort: returns 0 on any failure (pre-v117
  * brains have no table yet).
  */
 export async function purgeStaleVolunteerEvents(

@@ -24,6 +24,7 @@ import type { GBrainConfig } from './core/config.ts';
 import type { AIGatewayConfig } from './core/ai/types.ts';
 import type { BrainEngine } from './core/engine.ts';
 import { operations, OperationError } from './core/operations.ts';
+import { formatVolunteeredPage } from './core/context/volunteer.ts';
 import type { Operation, OperationContext } from './core/operations.ts';
 import { shouldForceExitAfterMain, finishCliTeardown, flushThenExit, currentExitCode, setCliExitVerdict } from './core/cli-force-exit.ts';
 import { serializeMarkdown } from './core/markdown.ts';
@@ -823,10 +824,7 @@ export function formatResult(opName: string, result: unknown): string {
       }
       const pages = (r?.pages ?? []) as any[];
       if (!pages.length) return 'Nothing volunteered (no entity cleared the confidence gate).\n';
-      return pages.map((p) =>
-        `${p.display} → ${p.slug} (${p.confidence.toFixed(2)}, ${p.arm}) — ${p.rationale}` +
-        (p.synopsis ? `\n    ${p.synopsis}` : ''),
-      ).join('\n') + '\n';
+      return pages.map((p) => formatVolunteeredPage(p)).join('\n') + '\n';
     }
     case 'get_page': {
       const r = result as any;
