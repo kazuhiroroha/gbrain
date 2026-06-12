@@ -348,7 +348,7 @@ per-release `**vX.Y.Z:**` narration — CI enforces this
 - `docs/guides/diligence-ingestion.md` — Data room to brain pages pipeline
 - `docs/designs/HOMEBREW_FOR_PERSONAL_AI.md` — 10-star vision for integration system
 - `docs/mcp/` — Per-client setup guides (Claude Desktop, Code, Cowork, Perplexity)
-- BrainBench (benchmark suite + corpus): lives in the separate [gbrain-evals](https://github.com/garrytan/gbrain-evals) repo. Not installed alongside gbrain.
+- BrainBench retrieval benchmark (P@5/R@5 corpus + harness): lives in the separate [gbrain-evals](https://github.com/garrytan/gbrain-evals) repo. Not installed alongside gbrain. Distinct from the in-repo cross-harness memory conformance suite (`gbrain eval brainbench` — `src/eval/brainbench/`, corpus at `evals/brainbench/`, methodology in `docs/eval/BRAINBENCH.md`).
 - `skills/_brain-filing-rules.md` — Cross-cutting brain filing rules (referenced by all brain-writing skills)
 - `skills/RESOLVER.md` — Skill routing table (based on the agent-fork AGENTS.md pattern)
 - `skills/conventions/` — Cross-cutting rules (quality, brain-first, model-routing, test-before-bulk, cross-modal)
@@ -392,12 +392,17 @@ per-release `**vX.Y.Z:**` narration — CI enforces this
 - `openclaw.plugin.json` — ClawHub bundle plugin manifest
 - `src/commands/capture.ts` + `src/commands/serve-http.ts` + `src/core/{operations,import-file,types,utils,facts/absorb-log,brainstorm/{orchestrator,error-classify},scope,postgres-engine,pglite-engine}.ts` extensions — ingestion-cathedral productionization after a smoke test against Supabase+PgBouncer. Capture frontmatter merge via `mergeCaptureFrontmatter` (uses gray-matter directly, NOT the lossy `parseMarkdown`); `/ingest` null-guard + outer try/catch envelope with `!res.headersSent` guard; dedup via separate normalize-for-hash (`normalizeForHash` strips BOM/CRLF/whitespace/NFKC) + body-after-frontmatter-strip on the DB hash (excludes `captured_at` + `ingested_at` so capture-cli timestamp variations don't invalidate the chunk cache); friendly `pages_source_id_fk` rewrite via `maybeRewriteSourceFkError` on BOTH local + thin-client `callRemoteTool` catch blocks; `facts:absorb` 'No database connection' suppression via typed `instanceof GBrainError && e.problem` check + first-occurrence stack-trace info log (module-scoped `_hasLoggedDisconnectedFactsAbsorb` flag, test seam `_resetFactsAbsorbDisconnectedFlagForTests`); CLI help discoverability (`capture` added to `CLI_ONLY_SELF_HELP` + pre-engine-bind `--help` short-circuit in `handleCliOnly` + a `BRAIN` section in `printHelp`); binary-file guard via `detectBinaryNullByte(buf)` first-8KB NUL scan on `--file` (Buffer-read, no encoding) and `--stdin` (`readStdinBuffer` accumulator); provenance write-through — put_page accepts 3 optional params (source_kind, source_uri, ingested_via; `ingested_at` server-stamped) + trust gate (when `ctx.remote !== false` IGNORE client params, server stamps `mcp:put_page`, fail-closed) + COALESCE-preserve UPDATE semantics (omitting params on a later put_page preserves prior values; first-write-wins); `/admin/api/register-client` scopes normalization via `normalizeScopesInput(raw: unknown)` in `src/core/scope.ts` (accepts string/string[]/missing; rejects `['read write']` space-in-element shape, non-string elements, empty array, unknown scopes; deduped + sorted); brainstorm timeout surfacing via an orchestrator-level try/catch at `runBrainstorm` entry (single-point wrap covers every internal SQL site, classifies SQLSTATE 57014 via postgres.js `.code` / `.sqlState` / message fallback into `StructuredAgentError` code `brainstorm_timeout` with a hint covering all 3 PG cancel sub-causes); read-path surfaces all 4 provenance columns via `getPage` projection + `rowToPage` 3-state optional read + `Page` interface; canonical source resolver routes capture through `resolveSourceWithTier(engine, parsed.source, cwd)`; thin-client `--source` rejection (server-side OAuth client registration owns source scope); the `source_kind` taxonomy is closed (`capture-cli | put_page | mcp:put_page | webhook | file-watcher | inbox-folder | cron-scheduler`), `--source` maps to source_id only. Tests: `test/capture-build-content.test.ts`, `test/capture-runcapture.test.ts`, `test/put-page-provenance.test.ts`, `test/scope-normalize.test.ts`, `test/cli-help-discoverability.test.ts`, `test/brainstorm-timeout.test.ts`; extended `test/facts-absorb-log.test.ts`, `test/import-file.test.ts`, `test/e2e/engine-parity.test.ts`, `test/e2e/serve-http-ingest-webhook.test.ts`. Report at `docs/v0.38-smoke-test-report.md`. Follow-ups in TODOS.md: SQL-shape rewrite of `listPrefixSampledPages` for PgBouncer, magic-byte allowlist for binary detection, `--source-kind` override flag, ingest_capture handler migration, provenance-history table, facts:absorb root-cause trace.
 
-### BrainBench — in a sibling repo (v0.20+)
+### BrainBench (retrieval benchmark) — in a sibling repo (v0.20+)
 
-BrainBench — the public benchmark for personal-knowledge agent stacks — lives in
+The retrieval-quality BrainBench — the public benchmark for personal-knowledge
+agent stacks (P@5/R@5/MRR/nDCG corpus + harness) — lives in
 [github.com/garrytan/gbrain-evals](https://github.com/garrytan/gbrain-evals). It
 depends on gbrain as a consumer; gbrain never pulls in the ~5MB eval corpus or
-the pdf-parse dev dep at install time.
+the pdf-parse dev dep at install time. The name "BrainBench" now primarily
+refers to the in-repo cross-harness memory conformance suite
+(`gbrain eval brainbench` — see the `src/eval/brainbench/` and
+`evals/brainbench/` entries above and `docs/eval/BRAINBENCH.md`); this section
+covers the older retrieval benchmark, which stands unchanged.
 
 gbrain's public API surface (the exports map in `package.json`) is what
 gbrain-evals consumes: `gbrain/engine`, `gbrain/types`, `gbrain/operations`,

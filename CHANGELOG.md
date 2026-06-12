@@ -21,21 +21,21 @@ Every scoreboard row carries a `seam` label: the `openclaw` row exercises the sh
 
 - `gbrain eval brainbench` — hermetic by default (in-memory PGLite, no keys, no LLM, ~7s for the full corpus), with `--harness`, `--suite`, `--fixtures DIR --gold DIR` (the foreign-runner surface), `--json`, `--out` (the canonical CI artifact), `--compare`, `--update-baseline`, `--justification`, `--allow-regression`, `--include-holdout`, and `--llm --budget-usd`. Exit codes are the contract: 0 pass, 1 regression, 2 error/inconclusive.
 - A 141-fixture / 241-gold-turn benchmark corpus across 7 stratified categories, generated deterministically (seed 42) over a whole-cloth fictional universe with SEALED gold (a `gold` key inside a fixture is a validation error; adapters only ever see sanitized turns), a ~15% holdout split, and a blind double-label validation receipt (96.4% agreement) recorded in the corpus ledger. Rebuild byte-identically with `bun evals/brainbench/generator/gen.ts`.
-- Published interchange contract for foreign runners: JSON Schemas for fixtures, gold, results, and baselines under `evals/brainbench/schema/` — point the CLI at any conforming corpus and parse the schema\'d receipt back.
-- A CI gate (`brainbench` job + `scripts/ci-brainbench-gate.sh`) hardened through four adversarial review rounds: it compares against MASTER\'s committed baseline (a PR cannot rewrite the thing it\'s graded by), any baseline edit without a fixture change must byte-match the actual run, corpus changes route through a bless mode where shrinking gold coverage or regressing a metric requires a written justification visible in the PR diff, baselines bind their run config, and the gate fails hard — never silently open — on broken refs or deleted baselines.
+- Published interchange contract for foreign runners: JSON Schemas for fixtures, gold, results, and baselines under `evals/brainbench/schema/` — point the CLI at any conforming corpus and parse the schema'd receipt back.
+- A CI gate (`brainbench` job + `scripts/ci-brainbench-gate.sh`) hardened through four adversarial review rounds: it compares against MASTER's committed baseline (a PR cannot rewrite the thing it's graded by), any baseline edit without a fixture change must byte-match the actual run, corpus changes route through a bless mode where shrinking gold coverage or regressing a metric requires a written justification visible in the PR diff, baselines bind their run config, and the gate fails hard — never silently open — on broken refs or deleted baselines.
 - Eleven new metrics in the metric glossary (plain-English definitions in `docs/eval/METRIC_GLOSSARY.md`); every JSON response carries the standard `_meta.metric_glossary` block.
 - Methodology doc at `docs/eval/BRAINBENCH.md`: seam disclosure, formulas, pre-registered expectations, determinism posture, gate governance, gold methodology, and accepted residuals.
 
 ### Changed
 
-- `gbrain eval run-all --suites brainbench` now actually runs the suite in-process (closing the long-standing orchestrator-stub follow-up) and records one result per sweep under `EvalRunRecord` schema v3 with `mode: \'n/a\'` — benchmark records no longer fabricate a search mode.
+- `gbrain eval run-all --suites brainbench` now actually runs the suite in-process (closing the long-standing orchestrator-stub follow-up) and records one result per sweep under `EvalRunRecord` schema v3 with `mode: 'n/a'` — benchmark records no longer fabricate a search mode.
 - The conversation-facts pipeline accepts an injectable per-segment extractor (default unchanged — the LLM path); this is the seam the write-back suite grades production code through.
 - The synthetic-corpus privacy guard now scans the BrainBench corpus dirs (fixtures AND gold) alongside the calibration corpus, and the fixture-authoring guide adds scenario-level privacy rules: scenarios are invented whole-cloth, never anonymized from real situations.
-- The CI aggregate (`test-status`) now checks the brainbench job\'s result explicitly — a failing memory gate fails the branch-protection check.
+- The CI aggregate (`test-status`) now checks the brainbench job's result explicitly — a failing memory gate fails the branch-protection check.
 
 ### Fixed
 
-- CLI exit codes for the new command route through the shared write-fence + aliveness-grace exit seam, so PGLite\'s WASM exit-code stomping and Bun\'s exit-time stdout discard can\'t corrupt the CI contract.
+- CLI exit codes for the new command route through the shared write-fence + aliveness-grace exit seam, so PGLite's WASM exit-code stomping and Bun's exit-time stdout discard can't corrupt the CI contract.
 
 To take advantage of v0.43.0.0: run `gbrain eval brainbench` — no setup, no keys, no brain required. If it ever reports something broken after an upgrade, `bun evals/brainbench/generator/gen.ts` rebuilds the corpus byte-identically and `gbrain eval brainbench --update-baseline` re-derives the baseline from an actual run; both are safe to re-run any time.
 
