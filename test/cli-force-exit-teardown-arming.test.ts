@@ -1,64 +1,55 @@
 /**
- * Structural regression — the DISCONNECT_HARD_DEADLINE_MS force-exit timer
- * must be armed at TEARDOWN ENTRY, never before the op-dispatch try block.
+ * Structural regression — the teardown hard-deadline must be armed at
+ * TEARDOWN ENTRY, never before the op-dispatch body.
  *
- * Pre-fix bug (fixed independently by master's v0.42.41.0 triage wave AND
- * the #2084 wave): the 10s unref'd setTimeout was armed BEFORE the try, so
- * any op whose handler ran past 10s wall-clock was killed mid-flight with
- * process.exit(0) and ZERO stdout — an empty "success" indistinguishable
- * from no results (a healthy `gbrain search` on a slow Postgres pooler hit
- * this on every run).
+ * Pre-fix bug (closed independently by v0.42.41.0 and the #2084 wave, merged):
+ * a 10s unref'd setTimeout armed BEFORE the try killed any op whose handler
+ * ran past 10s wall-clock with process.exit(0) and ZERO stdout — an empty
+ * "success" indistinguishable from no results.
  *
- * Post-#2084 the arming lives INSIDE the shared `drainThenDisconnect`
- * helper — the single owner-disconnect every CLI exit path calls from its
- * finally — so it structurally bounds ONLY the teardown window (drain +
- * disconnect) at every site, not just the op-dispatch path.
- *
- * Source-grep is the right tool here (same rationale as
- * fix-wave-structural.test.ts): the rule is "this arming must stay at this
- * location". A behavioral test would need >10s of real wall-clock plus a
- * deliberately slow op handler in a spawned CLI — slow and flaky by
- * construction.
+ * Post-merge shape (#2084): the deadline lives inside `finishCliTeardown`
+ * (src/core/cli-force-exit.ts), armed as the helper's first act — i.e. at
+ * teardown entry, because every cli.ts call site invokes the helper from a
+ * `finally`. The op body's wallclock is bounded separately by the read-scope
+ * withTimeout wrap (v0.42.41.0). Source-grep is the right tool here (same
+ * rationale as fix-wave-structural.test.ts): a behavioral test would need
+ * >10s of real wall-clock in a spawned CLI.
  */
 
 import { describe, test, expect } from 'bun:test';
 import { readFileSync } from 'fs';
 
 describe('cli.ts — disconnect hard-deadline armed at teardown entry, not before the op body', () => {
-  test('no timer arming between the op-dispatch entry and its try block', () => {
-    const src = readFileSync('src/cli.ts', 'utf8');
-    // The op-dispatch local-engine path: from connectEngine to its try, no
-    // setTimeout call may be armed (a pre-try timer kills slow-but-progressing
-    // op handlers mid-flight with exit 0 and empty stdout). `setTimeout(`
-    // matches only a call site; ReturnType<typeof setTimeout> stays allowed.
-    const entry = src.indexOf('// Local engine path (unchanged behavior');
-    expect(entry).toBeGreaterThan(-1);
-    const tryIdx = src.indexOf('try {', entry);
+  test('no timer arming exists between op-dispatch setup and the try; the deadline arms inside finishCliTeardown before the drain', () => {
+    const cli = readFileSync('src/cli.ts', 'utf8');
+
+    // The old pre-try arming constant must stay gone (its return is the
+    // kill-slow-ops-with-exit-0 regression).
+    expect(cli).not.toContain('DISCONNECT_HARD_DEADLINE_MS');
+
+    // Between the op-dispatch engine connect and the try there is no
+    // setTimeout call site (`setTimeout(` matches calls only; the
+    // ReturnType<typeof setTimeout> annotation stays allowed).
+    const connectIdx = cli.indexOf('// Local engine path (unchanged behavior for local installs).');
+    expect(connectIdx).toBeGreaterThan(-1);
+    const tryIdx = cli.indexOf('try {', connectIdx);
     expect(tryIdx).toBeGreaterThan(-1);
-    expect(src.slice(entry, tryIdx)).not.toContain('setTimeout(');
-  });
+    expect(cli.slice(connectIdx, tryIdx)).not.toContain('setTimeout(');
 
-  test('the deadline arming lives inside drainThenDisconnect: gated, unref\'d, before the drain, cleared after', () => {
-    const src = readFileSync('src/cli.ts', 'utf8');
-    const helper = src.match(/export async function drainThenDisconnect[\s\S]+?^\}/m);
-    expect(helper).not.toBeNull();
-    const block = helper![0];
+    // The op-dispatch finally routes through the shared teardown helper.
+    const finallyIdx = cli.indexOf('} finally {', tryIdx);
+    expect(finallyIdx).toBeGreaterThan(-1);
+    const teardownCallIdx = cli.indexOf('finishCliTeardown({ engine, drainTimeoutMs: 1000 })', finallyIdx);
+    expect(teardownCallIdx).toBeGreaterThan(finallyIdx);
 
-    const armIdx = block.indexOf('deadlineTimer = setTimeout');
-    const drainIdx = block.indexOf('drainAllBackgroundWorkForCliExit');
+    // Inside the helper, the backstop arms BEFORE the drain runs — teardown
+    // entry, bounding drain + disconnect and nothing else.
+    const helper = readFileSync('src/core/cli-force-exit.ts', 'utf8');
+    const armIdx = helper.indexOf('const backstop = setTimeout(');
     expect(armIdx).toBeGreaterThan(-1);
-    expect(drainIdx).toBeGreaterThan(-1);
-    // Armed at teardown entry, before the drain + disconnect it bounds.
-    expect(armIdx).toBeLessThan(drainIdx);
-    // Gated on the daemon-survival guard so `serve` stays alive.
-    expect(block.slice(0, armIdx)).toMatch(/if \(shouldForceExitAfterMain\(\)\)/);
-    // Unref'd so the timer itself never keeps the event loop alive.
-    expect(block).toContain('deadlineTimer.unref?.()');
+    const drainIdx = helper.indexOf('await drain({ timeoutMs: drainTimeoutMs })', armIdx);
+    expect(drainIdx).toBeGreaterThan(armIdx);
     // Cleared on clean teardown.
-    expect(block).toContain('if (deadlineTimer) clearTimeout(deadlineTimer)');
-    // The DISCONNECT_HARD_DEADLINE_MS declaration sits with the helper.
-    const decl = src.indexOf('const DISCONNECT_HARD_DEADLINE_MS');
-    expect(decl).toBeGreaterThan(-1);
-    expect(src.indexOf('export async function drainThenDisconnect')).toBeGreaterThan(decl);
+    expect(helper.indexOf('clearTimeout(backstop)', drainIdx)).toBeGreaterThan(drainIdx);
   });
 });

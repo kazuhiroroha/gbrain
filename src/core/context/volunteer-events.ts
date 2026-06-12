@@ -73,7 +73,7 @@ export async function insertVolunteerEvents(
 
 // ── Fire-and-forget sink (eng-review D4) ─────────────────────────────────
 // Mirrors src/core/last-retrieved.ts: track every dangling INSERT promise in
-// a module Set, register a drainer so drainThenDisconnect settles them
+// a module Set, register a drainer so finishCliTeardown settles them
 // against a live engine before teardown on EVERY CLI exit path (the commit-1
 // drain hoist). Logging failure never fails the caller.
 

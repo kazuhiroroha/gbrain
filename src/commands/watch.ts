@@ -10,7 +10,7 @@
  * Lifecycle: BLOCKS in the stdin iteration (like `gbrain jobs work`), so an
  * interactive TTY session stays alive until Ctrl-C / Ctrl-D and piped input
  * exits at EOF. Either way the handler RETURNS, the CLI_ONLY finally runs
- * drainThenDisconnect (volunteer events bank before teardown), and the
+ * finishCliTeardown (volunteer events bank before teardown), and the
  * entrypoint flush-exit ends the process deliberately — which is exactly why
  * `watch` is NOT in DAEMON_COMMANDS: it never returns from main() while work
  * is still running. SIGINT closes the stream and flows through the same

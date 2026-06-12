@@ -25,8 +25,7 @@ import type { AIGatewayConfig } from './core/ai/types.ts';
 import type { BrainEngine } from './core/engine.ts';
 import { operations, OperationError } from './core/operations.ts';
 import type { Operation, OperationContext } from './core/operations.ts';
-import { drainAllBackgroundWorkForCliExit } from './core/background-work.ts';
-import { shouldForceExitAfterMain, flushStdoutThenExit, setCliExitCode, getCliExitCode } from './core/cli-force-exit.ts';
+import { shouldForceExitAfterMain, finishCliTeardown, flushThenExit, currentExitCode, setCliExitVerdict } from './core/cli-force-exit.ts';
 import { serializeMarkdown } from './core/markdown.ts';
 import { parseGlobalFlags, setCliOptions, getCliOptions } from './core/cli-options.ts';
 import type { CliOptions } from './core/cli-options.ts';
@@ -262,9 +261,11 @@ async function main() {
         await withTimeout(runSearch(engine, subArgs), timeoutMs, label);
       }
     } finally {
-      // search stats/tune read the query_cache — a pending cache write must
-      // drain, not get killed by the deliberate exit (#2084 drain hoist).
-      await drainThenDisconnect(engine);
+      // #2084: `search diagnose` runs real hybrid retrieval (arms search-cache
+      // writes) — route through the shared bounded teardown like every other
+      // one-shot path. The connect-timeout process.exit(124) above is reviewed
+      // and intentionally unchanged: no engine exists at that point.
+      await finishCliTeardown({ engine });
     }
     return;
   }
@@ -354,42 +355,26 @@ async function main() {
 
   // Local engine path (unchanged behavior for local installs).
   const engine = await connectEngine();
-  // v0.41.8.0 (#1247, #1269, #1290): the search / query / get_page
-  // op handlers fire-and-forget `bumpLastRetrievedAt` after returning
-  // results. On PGLite that IIFE keeps Bun's event loop alive past
-  // engine.disconnect(), hanging the CLI at ~95-98% CPU until SIGKILL.
-  // Drain the fire-and-forget set BEFORE disconnect; force-exit only
-  // if the drain itself times out (preserves stderr diagnostic signal
-  // AND guarantees the CLI doesn't re-hang at the disconnect layer).
-  //
-  // Defense-in-depth (adversarial-review C13): `engine.disconnect()` itself
-  // can hang on PGLite (db.close() or releaseLock racing OS-level FS state).
-  // The unref'd hard-exit fallback is armed inside drainThenDisconnect (called
-  // from the `finally` below), so it bounds ONLY the teardown phase (drain +
-  // disconnect) — the same helper every owner-disconnect site uses. It used to
-  // be armed HERE, before the try, which silently killed any op whose BODY ran
-  // past the deadline: on a slow Postgres pooler (6-10s per fresh connection)
-  // a healthy `gbrain search` was force-exited mid-handler with code 0 and
-  // ZERO stdout — an empty "success" indistinguishable from no results. The
-  // exitCode honor (v0.42.20.0) can't help there: a mid-op kill fires before
-  // any error path sets exitCode. Op-body wallclock bounds are the read-scope
-  // withTimeout wrap inside the try below, not this teardown backstop.
-  // Daemons (`serve`) are excluded so they stay alive.
-  // Wallclock bound for READ-scope op handlers. With the hard-deadline timer
-  // correctly scoped to teardown, a genuinely WEDGED read handler (hung pooler
-  // connection mid-query) would otherwise hang the CLI forever — the #1633
-  // zombie class the old (buggy) pre-try timer accidentally bounded at 10s.
-  // 180s sits far above any healthy slow-pooler run (6-10s/connection);
-  // --timeout=Ns overrides. Writes/admin stay unbounded: a long import/embed
-  // must never be killed by a default deadline.
+  // #2084: the teardown contract (bounded drain of every background-work sink,
+  // bounded disconnect, computed-deadline backstop) lives in finishCliTeardown
+  // — see src/core/cli-force-exit.ts for the full design. The hard-deadline
+  // timer arms at TEARDOWN start inside the helper, never before the handler:
+  // the pre-#2084 placement here measured handler + teardown combined, so a
+  // slow-but-healthy query burned the teardown budget (the flat-10s-banner
+  // bug) and any >10s op was force-killed mid-run with exit 0. The explicit
+  // process exit happens once, in the import.meta.main seam at the bottom of
+  // this file — NOT here.
+
+  // v0.42.41.0 (merged): wallclock bound for READ-scope op handlers. With the
+  // teardown backstop correctly scoped to teardown, a genuinely WEDGED read
+  // handler (hung pooler connection mid-query) would otherwise hang the CLI
+  // forever — the #1633 zombie class the old pre-try timer accidentally
+  // bounded at 10s. 180s sits far above any healthy slow-pooler run
+  // (6-10s/connection); --timeout=Ns overrides. Writes/admin stay unbounded:
+  // a long import/embed must never be killed by a default deadline. On
+  // timeout the abandoned handler may hold ref'd sockets — harmless here,
+  // because the import.meta.main seam exits explicitly on every one-shot path.
   const READ_OP_TIMEOUT_MS = 180_000;
-  // Set when a wallclock bound fired. The abandoned (timed-out but still
-  // running) handler can hold ref'd sockets/timers that keep Bun's event loop
-  // alive after main() returns — so the finally must hard-exit after teardown
-  // on this path, or the timeout print is followed by an immortal process:
-  // the same zombie class, resurrected through the timeout door (adversarial
-  // review finding).
-  let wallclockTimedOut = false;
 
   try {
     const { withTimeout, OperationTimeoutError } = await import('./core/timeout.ts');
@@ -399,8 +384,10 @@ async function main() {
         ? ''
         : ` (default ${e.ms}ms; pass --timeout=Ns to override)`;
       console.error(`${e.label} timed out${hint}.`);
-      setCliExitCode(124);
-      wallclockTimedOut = true;
+      // 124 = timeout convention (matches the read-only dispatch path). Set
+      // through the verdict channel — a raw process.exitCode write is invisible
+      // to the exit seam and PGLite's WASM runtime can scribble over it.
+      setCliExitVerdict(124);
     };
 
     // Context build does DB I/O (resolveSourceId) and runs for EVERY op —
@@ -416,7 +403,7 @@ async function main() {
     } catch (e: unknown) {
       if (e instanceof OperationTimeoutError) {
         onWallclockTimeout(e);
-        return; // the finally below still drains + disconnects, then exits
+        return; // the finally drains + disconnects; the import.meta.main seam exits
       }
       throw e;
     }
@@ -432,7 +419,7 @@ async function main() {
       } catch (e: unknown) {
         if (e instanceof OperationTimeoutError) {
           onWallclockTimeout(e);
-          return; // the finally below still drains + disconnects, then exits
+          return; // the finally drains + disconnects; the import.meta.main seam exits
         }
         throw e;
       }
@@ -459,76 +446,12 @@ async function main() {
     } else {
       console.error(e instanceof Error ? e.message : String(e));
     }
-    setCliExitCode(1);
+    setCliExitVerdict(1);
   } finally {
-    // 1s per-sink drain timeout: read paths with no pending work pay the
-    // ~0ms fast path; capture/import that DO enqueue pay up to 1s (+ facts
-    // shutdown grace) while in-flight Haiku finishes.
-    await drainThenDisconnect(engine, { drainTimeoutMs: 1000 });
-    // Wallclock-timeout path (master v0.42.41.0): the ABANDONED handler
-    // (withTimeout races, it does not cancel) can hold ref'd sockets / SDK
-    // retry timers that keep Bun's event loop alive. The entrypoint
-    // flush-exit fires when main() resolves and covers this; the explicit
-    // call here is belt-and-braces in case a future caller invokes this op
-    // path outside the guarded entrypoint.
-    if (wallclockTimedOut) {
-      void flushStdoutThenExit(getCliExitCode());
-    }
-  }
-}
-
-/**
- * v0.43 (#2084, closes the TODOS P3 drain-hoist) — THE owner-disconnect for
- * every CLI exit path. One helper, all sites, so a future teardown bug has
- * one place to be wrong in.
- *
- *   drainThenDisconnect(engine)
- *     ├── arm unref'd 10s hard-deadline (HUNG-teardown backstop — PGLite
- *     │     db.close()/releaseLock can hang on OS-level FS state; the
- *     │     entrypoint flush-exit can never fire if main() never resolves)
- *     ├── drain background-work registry (facts → last-retrieved →
- *     │     search-cache → eval-capture → volunteer-events), so a PGLite
- *     │     db.close() can't race in-flight work into the re-pump
- *     │     busy-loop (#1762)
- *     └── engine.disconnect() (best-effort), then clear the deadline
- *
- * The 10s timer is armed HERE — around the teardown window only — never
- * before the op handler (master's v0.42.41.0 triage wave fixed the same
- * pre-armed-timer bug independently: it force-killed any op slower than
- * 10s). On the happy path the timer never fires: main() resolves and the
- * entrypoint's flushStdoutThenExit ends the process deliberately (#2084's
- * fix for lingering embedding/PgBouncer sockets riding the backstop).
- */
-const DISCONNECT_HARD_DEADLINE_MS = 10_000;
-export async function drainThenDisconnect(
-  engine: BrainEngine,
-  opts?: { drainTimeoutMs?: number },
-): Promise<void> {
-  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-  if (shouldForceExitAfterMain()) {
-    deadlineTimer = setTimeout(() => {
-      console.warn(
-        `[cli] engine.disconnect() did not return within ${DISCONNECT_HARD_DEADLINE_MS}ms — force-exiting`,
-      );
-      // Honor an exit code an errored op already set — a bare process.exit(0)
-      // here would mask a failed op as success if the drain/disconnect hangs.
-      process.exit(getCliExitCode());
-    }, DISCONNECT_HARD_DEADLINE_MS);
-    // unref so the timer itself doesn't keep the event loop alive — only
-    // the actual pending work (PGLite WASM handle) does.
-    deadlineTimer.unref?.();
-  }
-  try {
-    await drainAllBackgroundWorkForCliExit(
-      opts?.drainTimeoutMs !== undefined ? { timeoutMs: opts.drainTimeoutMs } : undefined,
-    );
-    try {
-      await engine.disconnect();
-    } catch {
-      /* best-effort — kernel reclaims sockets on exit (timeout.ts doctrine) */
-    }
-  } finally {
-    if (deadlineTimer) clearTimeout(deadlineTimer);
+    // 1s per-sink drain budget: read paths with no pending work pay the ~0ms
+    // fast path; capture/import that DO enqueue pay up to 1s (+ facts shutdown
+    // grace) while in-flight Haiku finishes (#1762 drain-before-disconnect).
+    await finishCliTeardown({ engine, drainTimeoutMs: 1000 });
   }
 }
 
@@ -1260,15 +1183,13 @@ async function handleCliOnly(command: string, args: string[]) {
   }
   if (command === 'friction') {
     const { runFriction } = await import('./commands/friction.ts');
-    // v0.43 (#2084 inner-exit sweep): exitCode + return instead of a
-    // mid-handler process.exit — flows through the entrypoint flush-exit
-    // so buffered stdout is never truncated.
-    setCliExitCode(runFriction(args));
+    // #2084 inner-exit sweep: verdict + return so teardown + the flush seam run.
+    setCliExitVerdict(runFriction(args));
     return;
   }
   if (command === 'claw-test') {
     const { runClawTest } = await import('./commands/claw-test.ts');
-    setCliExitCode(await runClawTest(args));
+    setCliExitVerdict(await runClawTest(args));
     return;
   }
   if (command === 'report') {
@@ -1315,13 +1236,13 @@ async function handleCliOnly(command: string, args: string[]) {
     if (args.includes('--remediation-plan')) {
       const { runRemediationPlan } = await import('./commands/doctor.ts');
       const eng = await connectEngine();
-      try { await runRemediationPlan(eng, args); } finally { await drainThenDisconnect(eng); }
+      try { await runRemediationPlan(eng, args); } finally { await finishCliTeardown({ engine: eng }); }
       return;
     }
     if (args.includes('--remediate')) {
       const { runRemediate } = await import('./commands/doctor.ts');
       const eng = await connectEngine();
-      try { await runRemediate(eng, args); } finally { await drainThenDisconnect(eng); }
+      try { await runRemediate(eng, args); } finally { await finishCliTeardown({ engine: eng }); }
       return;
     }
 
@@ -1334,13 +1255,21 @@ async function handleCliOnly(command: string, args: string[]) {
       // "user chose --fast while config is present".
       await runDoctor(null, args, getDbUrlSource());
     } else {
+      // #2084: both failure kinds (connect throw, runDoctor(eng) throw) still
+      // fall back to filesystem-only checks — identical to the prior shape.
+      // The finally closes the gap where a runDoctor(eng) throw used to skip
+      // the in-try disconnect. NOTE: runDoctor normally calls process.exit
+      // itself, which preempts this finally — in-command exit sites bypassing
+      // teardown are a pre-existing class, tracked as a TODOS.md follow-up.
+      let eng: BrainEngine | null = null;
       try {
-        const eng = await connectEngine();
+        eng = await connectEngine();
         await runDoctor(eng, args);
-        await drainThenDisconnect(eng);
       } catch {
         // DB unavailable — still run filesystem checks
         await runDoctor(null, args, getDbUrlSource());
+      } finally {
+        if (eng) await finishCliTeardown({ engine: eng });
       }
     }
     return;
@@ -1354,7 +1283,7 @@ async function handleCliOnly(command: string, args: string[]) {
     try {
       await runZeSwitch(args, eng);
     } finally {
-      await drainThenDisconnect(eng);
+      await finishCliTeardown({ engine: eng });
     }
     return;
   }
@@ -1370,7 +1299,7 @@ async function handleCliOnly(command: string, args: string[]) {
       execSync(`bash "${scriptPath}"`, { stdio: 'inherit', env: { ...process.env } });
     } catch (e: any) {
       // Non-zero exit = some tests failed (exit code = failure count)
-      setCliExitCode(e.status ?? 1);
+      setCliExitVerdict(e.status ?? 1);
     }
     return;
   }
@@ -1399,14 +1328,15 @@ async function handleCliOnly(command: string, args: string[]) {
       await runDream(eng, args);
     } finally {
       // #1471 invariant tripwire (the dream-cycle owner): `eng` created the
-      // module singleton (first module connector) and is disconnected LAST,
+      // module singleton (first module connector) and is torn down LAST,
       // here, after the whole cycle. The ownership fix relies on this owner's
       // lifetime strictly dominating every borrower (lint/doctor probe engines
-      // created mid-cycle). Do NOT disconnect `eng` before runDream returns, or
+      // created mid-cycle). Do NOT tear down `eng` before runDream returns, or
       // a borrower could outlive the owner and lose the shared singleton.
-      // #2084 drain hoist: dream's cycle enqueues facts/last-retrieved
-      // writes — drain them against the live owner engine before teardown.
-      if (eng) await drainThenDisconnect(eng);
+      // #2084: routed through the shared bounded teardown — dream runs as an
+      // overnight cron, where a lingering-socket hang is a silent zombie
+      // (closes the TODOS.md drain-before-owner-disconnect item).
+      if (eng) await finishCliTeardown({ engine: eng });
     }
     return;
   }
@@ -1418,7 +1348,7 @@ async function handleCliOnly(command: string, args: string[]) {
   // The handler self-configures the AI gateway from loadConfig() + process.env.
   if (command === 'eval' && args[0] === 'cross-modal') {
     const { runEvalCrossModal } = await import('./commands/eval-cross-modal.ts');
-    setCliExitCode(await runEvalCrossModal(args.slice(1)));
+    setCliExitVerdict(await runEvalCrossModal(args.slice(1)));
     return;
   }
 
@@ -1430,7 +1360,7 @@ async function handleCliOnly(command: string, args: string[]) {
   // engine-required path below.
   if (command === 'eval' && args[0] === 'takes-quality' && args[1] === 'replay') {
     const { runReplayNoBrain } = await import('./commands/eval-takes-quality.ts');
-    setCliExitCode(await runReplayNoBrain(args.slice(2)));
+    setCliExitVerdict(await runReplayNoBrain(args.slice(2)));
     return;
   }
 
@@ -1463,7 +1393,7 @@ async function handleCliOnly(command: string, args: string[]) {
   // gate runs on machines with no `~/.gbrain/config.json`.
   if (command === 'eval' && args[0] === 'conversation-parser') {
     const { runEvalConversationParser } = await import('./commands/eval-conversation-parser.ts');
-    setCliExitCode(await runEvalConversationParser(args.slice(1)));
+    setCliExitVerdict(await runEvalConversationParser(args.slice(1)));
     return;
   }
 
@@ -1492,7 +1422,7 @@ async function handleCliOnly(command: string, args: string[]) {
     const cfgPre = loadConfig();
     if (isThinClient(cfgPre)) {
       const { runEvalWhoknows } = await import('./commands/eval-whoknows.ts');
-      setCliExitCode(await runEvalWhoknows(null, args.slice(1)));
+      setCliExitVerdict(await runEvalWhoknows(null, args.slice(1)));
       return;
     }
   }
@@ -1507,7 +1437,7 @@ async function handleCliOnly(command: string, args: string[]) {
     if (cfgPre && isThinClient(cfgPre)) {
       const { runStatus } = await import('./commands/status.ts');
       const result = await runStatus(null, args);
-      setCliExitCode(result.exitCode);
+      setCliExitVerdict(result.exitCode);
       return;
     }
   }
@@ -1587,9 +1517,7 @@ async function handleCliOnly(command: string, args: string[]) {
       }
       throw e;
     } finally {
-      // #2084 drain hoist: `gbrain search` writes the query cache + bumps
-      // last_retrieved_at fire-and-forget — drain before disconnect.
-      await drainThenDisconnect(engine);
+      await finishCliTeardown({ engine });
     }
     return;
   }
@@ -1641,7 +1569,7 @@ async function handleCliOnly(command: string, args: string[]) {
         // so wrappers (sync, CI scripts, `&& gbrain doctor`) propagate.
         const importResult = await runImport(engine, args);
         if (importResult.errors > 0) {
-          setCliExitCode(1);
+          setCliExitVerdict(1);
         }
         break;
       }
@@ -1823,10 +1751,8 @@ async function handleCliOnly(command: string, args: string[]) {
       case 'status': {
         const { runStatus } = await import('./commands/status.ts');
         const result = await runStatus(engine, args);
-        // v0.43 (#2084 inner-exit sweep): a mid-switch process.exit skipped
-        // the finally's drain + disconnect entirely. exitCode + break flows
-        // through both, then the entrypoint flush-exit ends the process.
-        setCliExitCode(result.exitCode);
+        // #2084 inner-exit sweep: a mid-switch exit skips the finally teardown.
+        setCliExitVerdict(result.exitCode);
         break;
       }
       // v0.38 — Capture: single human-facing entrypoint for ingestion.
@@ -1999,7 +1925,8 @@ async function handleCliOnly(command: string, args: string[]) {
       case 'watch': {
         // v0.43 (#2095): push-based context transport. Blocks in the stdin
         // iteration (interactive stays alive; piped exits at EOF), then the
-        // finally below drains the volunteer-events sink with everything else.
+        // finally below runs finishCliTeardown (volunteer events drain with
+        // every other sink) and the import.meta.main seam flush-exits.
         const { runWatch } = await import('./commands/watch.ts');
         await runWatch(engine, args);
         break;
@@ -2074,20 +2001,16 @@ async function handleCliOnly(command: string, args: string[]) {
     }
   } finally {
     syncWatchdog?.dispose(); // #1633: tear down the hard-deadline watchdog on clean exit
-    // v0.42.20.0 (#1762) — the CLI_ONLY path (which owns `gbrain capture`)
-    // lacked the op-dispatch drain-before-disconnect contract. `put_page` fires
-    // a fire-and-forget facts:absorb job AFTER printing the receipt; on a
-    // multi-chunk page that job is in flight when this finally tears the engine
-    // down, and `engine.disconnect()` nulling PGLite's _db mid-job spins
-    // db.close() into a 100%-CPU busy-loop that pins the single-writer lock.
-    // Drain every background-work sink first (facts shutdown() abort cancels a
-    // hung Haiku), THEN disconnect. The drain-before-disconnect is the causal
-    // fix; the force-exit defense below is secondary (it CANNOT preempt a WASM
-    // busy-loop on a pinned JS thread — that's exactly why the drain matters).
-    // #1471: this is also the fall-through OWNER-disconnect — the owner is torn
-    // down LAST (after the drain), so module-singleton borrowers never outlive it.
+    // #2084 — the CLI_ONLY fall-through teardown (drain every background-work
+    // sink, THEN disconnect, under a computed-deadline backstop) lives in
+    // finishCliTeardown. `gbrain capture`'s fire-and-forget facts:absorb job
+    // gets its drain window before PGLite's db.close() can race it into the
+    // re-pump busy-loop (#1762). #1471: this is also the fall-through
+    // OWNER-disconnect — the owner is torn down LAST (after the drain), so
+    // module-singleton borrowers never outlive it. `serve` skips teardown
+    // entirely: the daemon owns its lifecycle.
     if (command !== 'serve') {
-      await drainThenDisconnect(engine);
+      await finishCliTeardown({ engine });
     }
   }
 }
@@ -2401,21 +2324,25 @@ Run gbrain <command> --help for command-specific help.
 // Only auto-run when invoked as the entry point (the compiled binary or
 // `bun src/cli.ts`). Guarded so tests can import cliAliases / printOpHelp
 // without triggering argv parsing + main(). v114 (#1941).
+//
+// #2084 — the ONE process-exit seam for one-shot commands. Every teardown site
+// routes through finishCliTeardown (which returns); the exit itself happens
+// here, after main() settles, so the CLI never waits on Bun's event loop to
+// drain (stuck PgBouncer sockets kept it alive — endPoolBounded races PAST a
+// stuck pool.end() by design). flushThenExit fences stdout/stderr and holds a
+// short aliveness grace so piped output is delivered before exit (#1959).
+// Daemons (`serve`) are excluded by shouldForceExitAfterMain and keep the
+// pre-#2084 behavior: main() resolves and the server's own work keeps the
+// process alive. A fatal error still exits 1 for every command, daemons
+// included (matches the prior unconditional process.exit(1) on rejection).
 if (import.meta.main) {
-  // v0.43 (#2084): exit DELIBERATELY when main() resolves. Lingering sockets
-  // (embedding fetch keep-alive, PgBouncer txn-mode sockets endPoolBounded
-  // raced past) keep Bun's event loop alive after bounded teardown resolves —
-  // pre-fix, every `gbrain query` paid a flat 10s tax riding the hard-deadline
-  // backstop. flushStdoutThenExit drains stdout/stderr first (incident #1959:
-  // a force-exit truncated piped stdout). Daemons (serve; interactive watch)
-  // are excluded by shouldForceExitAfterMain and keep the event loop.
   main().then(
     () => {
-      if (shouldForceExitAfterMain()) void flushStdoutThenExit(getCliExitCode());
+      if (shouldForceExitAfterMain()) flushThenExit(currentExitCode());
     },
     (e) => {
-      console.error(e instanceof Error ? (e.message || String(e)) : String(e));
-      void flushStdoutThenExit(1);
+      console.error(e.message || e);
+      flushThenExit(1);
     },
   );
 }

@@ -13,6 +13,7 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import {
   runBrainstorm,
   formatBrainstormMarkdown,
@@ -27,7 +28,6 @@ import { serializeMarkdown } from '../core/markdown.ts';
 import { importFromContent } from '../core/import-file.ts';
 import { writePageThrough, type WriteThroughResult } from '../core/write-through.ts';
 import { randomBytes } from 'crypto';
-import { setCliExitCode } from '../core/cli-force-exit.ts';
 
 export interface BrainstormCliArgs {
   question?: string;
@@ -323,7 +323,7 @@ async function runBrainstormCli(
     const msg = formatSaveOutcome(outcome, { profileLabel: profile.label, slug });
     if (msg.stdout) console.log(msg.stdout);
     for (const line of msg.stderr) console.error(line);
-    if (msg.exitCode) setCliExitCode(msg.exitCode);
+    if (msg.exitCode) setCliExitVerdict(msg.exitCode);
   }
 }
 

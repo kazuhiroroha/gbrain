@@ -22,6 +22,7 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { MARKDOWN_CHUNKER_VERSION } from '../core/chunkers/recursive.ts';
 import { importFromContent, importFromFile } from '../core/import-file.ts';
 import { serializeMarkdown } from '../core/markdown.ts';
@@ -29,7 +30,6 @@ import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { existsSync } from 'fs';
 import { resolve } from 'path';
-import { setCliExitCode } from '../core/cli-force-exit.ts';
 // v0.41.15.0 (T10, D9): per-batch parallel workers.
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
@@ -151,7 +151,7 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
     } else {
       process.stderr.write('Usage: gbrain reindex --markdown [--limit N] [--dry-run] [--json] [--repo PATH]\n');
     }
-    setCliExitCode(2);
+    setCliExitVerdict(2);
     return { pending: 0, reindexed: 0, skipped: 0, failed: 0, dryRun: !!opts.dryRun, chunkerVersion: MARKDOWN_CHUNKER_VERSION };
   }
 

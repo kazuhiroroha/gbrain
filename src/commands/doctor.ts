@@ -1,6 +1,6 @@
 import type { BrainEngine } from '../core/engine.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import * as db from '../core/db.ts';
-import { setCliExitCode } from '../core/cli-force-exit.ts';
 import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
 import { checkResolvable } from '../core/check-resolvable.ts';
 import { autoFixDryViolations, type AutoFixReport, type FixOutcome } from '../core/dry-fix.ts';
@@ -7226,12 +7226,10 @@ export async function runDoctor(
     } catch { /* best-effort */ }
   }
 
-  // Use the owned exit verdict instead of process.exit() so cleanup handlers
-  // (e.g. Bun unload events, open database connections) still run before the
-  // process terminates — and so the deliberate flush-exit (#2084) reports
-  // doctor's verdict: a RAW process.exitCode write is silently zeroed by
-  // getCliExitCode() at the entrypoint (the PGLite-pollution defense).
-  setCliExitCode(hasFail ? 1 : 0);
+  // Use process.exitCode instead of process.exit() so cleanup handlers
+  // (e.g. Bun unload events, open database connections) still run before
+  // the process terminates. process.exit() is a hard kill that bypasses them.
+  setCliExitVerdict(hasFail ? 1 : 0);
 }
 
 // ---------------------------------------------------------------------------

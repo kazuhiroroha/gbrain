@@ -195,6 +195,32 @@ export function buildPgliteInitErrorMessage(
   return `${header}\n${hint}\n  Original error: ${original}`;
 }
 
+/**
+ * #2084 — PGLite's Emscripten runtime hijacks `process.exitCode` as ITS status
+ * channel: instantiation REPLACES the property with an accessor whose getter
+ * falls back to the WASM runtime status (99 while alive, the exit status after
+ * close) whenever no explicit value was assigned — and assigning `undefined`
+ * resets to that fallback, so "unset" cannot be restored. Pre-fix, every clean
+ * PGLite run carried a bogus 99 until close zeroed it, and an errored op's
+ * exit 1 survived only by accident of write ordering.
+ *
+ * Containment: around PGlite.create(), snapshot the pre-call value and restore
+ * it — pinning an explicit 0 when nothing was set, because restoring
+ * `undefined` would surface the WASM fallback instead. This keeps the GLOBAL
+ * tidy for external readers; the CLI's own verdict never reads it (it lives in
+ * the owned channel: setCliExitVerdict/currentExitCode, cli-force-exit.ts —
+ * in-memory brains run initdb whose status lands on a later tick, past any
+ * snapshot). db.close() stays unwrapped (see the comment at the close site).
+ */
+async function preservingProcessExitCode<T>(fn: () => Promise<T>): Promise<T> {
+  const pre = process.exitCode;
+  try {
+    return await fn();
+  } finally {
+    process.exitCode = typeof pre === 'number' || typeof pre === 'string' ? pre : 0;
+  }
+}
+
 export class PGLiteEngine implements BrainEngine {
   readonly kind = 'pglite' as const;
   private _db: PGLiteDB | null = null;
@@ -243,13 +269,15 @@ export class PGLiteEngine implements BrainEngine {
     // the postmaster at close-time), and the writes land asynchronously —
     // a snapshot/restore around these awaits does NOT contain them. That is
     // why the CLI's exit paths read gbrain's own verdict
-    // (cli-force-exit.ts getCliExitCode), never ambient process.exitCode.
+    // (cli-force-exit.ts currentExitCode), never ambient process.exitCode.
     try {
-      this._db = await PGlite.create({
-        dataDir,
-        loadDataDir,
-        extensions: { vector, pg_trgm },
-      });
+      this._db = await preservingProcessExitCode(() =>
+        PGlite.create({
+          dataDir,
+          loadDataDir,
+          extensions: { vector, pg_trgm },
+        }),
+      );
     } catch (err) {
       // v0.13.1: any PGLite.create() failure becomes actionable. v0.41.8.0
       // (#1340): the previous error hint hardcoded the macOS 26.3 link, but
@@ -289,6 +317,12 @@ export class PGLiteEngine implements BrainEngine {
     this._lock = null;
     try {
       if (db) {
+        // Deliberately NOT wrapped in preservingProcessExitCode: close's
+        // status write (0) is long-standing baseline behavior that test-runner
+        // processes depend on (wrapping it flipped bun test's own exit code —
+        // #2084 implementation note), and the CLI's exit verdict doesn't read
+        // process.exitCode at all — it lives in the gbrain-owned channel
+        // (setCliExitVerdict/currentExitCode in cli-force-exit.ts).
         await db.close();
       }
     } finally {
