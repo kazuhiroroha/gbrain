@@ -70,4 +70,25 @@ describe('shouldForceExitAfterMain — daemon survival gate', () => {
     expect(shouldForceExitAfterMain(['serves'])).toBe(true);
     expect(shouldForceExitAfterMain(['serve-cluster'])).toBe(true);
   });
+
+  test('returns false for `watch` (v0.43 #2095 stdin-follow push daemon)', () => {
+    expect(shouldForceExitAfterMain(['watch'])).toBe(false);
+    expect(shouldForceExitAfterMain(['watch', '--json'])).toBe(false);
+    expect(shouldForceExitAfterMain(['--quiet', 'watch'])).toBe(false);
+  });
+
+  test('awaited long-runners exit deliberately when their handler resolves', () => {
+    // `jobs work`, `jobs watch --follow`, and `autopilot` BLOCK inside their
+    // awaited handler until done — when main() resolves for them, the work is
+    // over and the deliberate exit is correct (v0.43 #2084 contract). Only
+    // commands that RETURN from main() while the event loop carries the
+    // daemon (`serve`; interactive `watch`) belong in DAEMON_COMMANDS.
+    expect(shouldForceExitAfterMain(['jobs', 'work'])).toBe(true);
+    expect(shouldForceExitAfterMain(['jobs', 'watch', '--follow'])).toBe(true);
+    expect(shouldForceExitAfterMain(['autopilot'])).toBe(true);
+  });
+
+  test('substring match avoidance: `watcher` is NOT `watch`', () => {
+    expect(shouldForceExitAfterMain(['watcher'])).toBe(true);
+  });
 });
