@@ -79,6 +79,18 @@ export interface ReflexParams {
 export const DEFAULT_WINDOW_TURNS = 4;
 
 export function windowTurnCount(cfg: GBrainConfig | null): number {
+  // Env plane is read DIRECTLY here (mirroring reflexEnabled's direct
+  // process.env read), not just via loadConfig's env→config mapping. When
+  // there's no config file AND no DATABASE_URL, loadConfig() returns null and
+  // drops that mapping entirely — so without this, the documented
+  // GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS escape hatch would be silently
+  // ignored and the window would fall back to the default of 4 (a real
+  // config-less-environment bug, e.g. a clean CI shard with no brain).
+  const env = process.env.GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS;
+  if (env != null && env !== '') {
+    const e = Number(env);
+    if (Number.isFinite(e) && e >= 1) return Math.floor(e);
+  }
   const n = cfg?.retrieval_reflex_window_turns;
   if (typeof n === 'number' && Number.isFinite(n) && n >= 1) return Math.floor(n);
   return DEFAULT_WINDOW_TURNS;
