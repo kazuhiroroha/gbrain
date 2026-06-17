@@ -32,6 +32,7 @@
 
 import type { BrainEngine, SourceRow } from '../core/engine.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
+import { NON_GLOBAL_PHASES, GLOBAL_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
 
 const FULL_CYCLE_FLOOR_MIN = 60;
 
@@ -436,6 +437,11 @@ export async function dispatchPerSource(
           repoPath: opts.repoPath,
           source_id: src.id,
           pull: !!remoteUrl,
+          // #2194 fix #3 (cycle split): per-source cycles run ONLY source-scoped
+          // (+ mixed) phases. The brain-wide global phases (embed, orphans,
+          // purge, …) run once in autopilot-global-maintenance, not N times
+          // concurrently here — the fix for the 4→10GB RSS blowout.
+          phases: NON_GLOBAL_PHASES,
         },
         {
           queue: 'default',
@@ -503,4 +509,63 @@ export async function dispatchPerSource(
     skipped_cooldown: skippedCooldown.map(s => s.id),
     legacy_fallback: false,
   };
+}
+
+const GLOBAL_FLOOR_MIN = 60;
+
+/** Is the brain-wide maintenance overdue? Null/unparseable → overdue. */
+export function isGlobalMaintenanceStale(lastGlobalAtIso: string | null, now = Date.now(), floorMin = GLOBAL_FLOOR_MIN): boolean {
+  if (!lastGlobalAtIso) return true;
+  const d = new Date(lastGlobalAtIso);
+  if (!Number.isFinite(d.getTime())) return true;
+  return (now - d.getTime()) / 60_000 >= floorMin;
+}
+
+/**
+ * #2194 fix #3 / #2227 bug #3 — dispatch the single brain-wide maintenance job
+ * that runs the `global` cycle phases (embed, orphans, purge, …) ONCE per
+ * window, instead of N per-source cycles each running them concurrently (the
+ * RSS blowout). Single-flight is structural: one `idempotency_key` +
+ * `maxWaiting:1`, so a slow run never stacks. Gated on `autopilot.last_global_at`
+ * (stamped by the handler on success). Postgres-only fan-out concern; on PGLite
+ * the file lock already serializes, but the job is still correct there.
+ */
+export async function dispatchGlobalMaintenance(
+  engine: BrainEngine,
+  queue: MinionQueue,
+  opts: { repoPath: string; slot: string; timeoutMs: number; jsonMode: boolean; emit?: (l: string) => void; log?: (l: string) => void },
+): Promise<{ dispatched: boolean; reason: 'stale' | 'fresh' }> {
+  const emit = opts.emit ?? ((line) => process.stderr.write(line + '\n'));
+  const log = opts.log ?? ((line) => console.log(line));
+
+  let floorMin = GLOBAL_FLOOR_MIN;
+  const floorCfg = await engine.getConfig('autopilot.global_floor_min');
+  if (floorCfg) {
+    const n = parseInt(floorCfg, 10);
+    if (Number.isFinite(n) && n >= 1) floorMin = n;
+  }
+  const lastGlobalAt = await engine.getConfig(LAST_GLOBAL_AT_KEY);
+  if (!isGlobalMaintenanceStale(lastGlobalAt, Date.now(), floorMin)) {
+    return { dispatched: false, reason: 'fresh' };
+  }
+
+  const job = await queue.add(
+    'autopilot-global-maintenance',
+    { repoPath: opts.repoPath, phases: GLOBAL_PHASES },
+    {
+      queue: 'default',
+      // Structural single-flight: one global job per slot; maxWaiting:1 coalesces
+      // any surplus so a slow brain-wide pass never stacks duplicates.
+      idempotency_key: `autopilot-global:${opts.slot}`,
+      max_attempts: 2,
+      timeout_ms: opts.timeoutMs,
+      maxWaiting: 1,
+    },
+  );
+  if (opts.jsonMode) {
+    emit(JSON.stringify({ event: 'dispatched', job_id: job.id, mode: 'global_maintenance', slot: opts.slot }));
+  } else {
+    log(`[dispatch] job #${job.id} autopilot-global-maintenance (brain-wide phases)`);
+  }
+  return { dispatched: true, reason: 'stale' };
 }
