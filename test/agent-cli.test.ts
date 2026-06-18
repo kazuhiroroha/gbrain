@@ -106,6 +106,16 @@ describe('parseRunFlags', () => {
     expect(rest).toEqual(['do', 'x', '--detach']);
   });
 
+  test('#1738: -- AFTER a positional also suppresses hoisting (no silent detach flip)', () => {
+    // The leading-flag loop breaks at the first positional, so the `escaped`
+    // flag never fires for a `--` placed later. A literal `--` ANYWHERE must
+    // still mean "hoist nothing" — otherwise `agent run note -- body --detach`
+    // silently detaches and drops the `--` as junk.
+    const { flags, rest } = agentTesting.parseRunFlags(['note', '--', 'body', '--detach']);
+    expect(flags.detach).toBe(false);
+    expect(rest).toEqual(['note', '--', 'body', '--detach']);
+  });
+
   test('#1738: value-flag missing its value throws a usage error', () => {
     expect(() => agentTesting.parseRunFlags(['--model'])).toThrow(/requires a value/);
     expect(() => agentTesting.parseRunFlags(['--model', '--detach', 'x'])).toThrow(/requires a value/);

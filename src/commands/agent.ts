@@ -175,7 +175,12 @@ function parseRunFlags(args: string[]): { flags: RunFlags; rest: string[] } {
     if (!known) break; // unknown --flag → first token of the (freeform) prompt
   }
   const rest = args.slice(i);
-  if (!escaped) {
+  // An explicit `--` terminates flag parsing wherever it appears — leading
+  // zone (escaped) OR after a positional (the leading loop breaks before it,
+  // so `escaped` stays false). Honor both: when the prompt carries a literal
+  // `--`, hoist nothing, so `agent run note -- --detach` keeps `--detach`
+  // verbatim instead of silently flipping detach mode.
+  if (!escaped && !rest.includes('--')) {
     while (rest.length > 0 && BOOLEAN_TAIL_FLAGS.has(rest[rest.length - 1]!)) {
       applyBooleanFlag(flags, rest.pop()!);
     }
