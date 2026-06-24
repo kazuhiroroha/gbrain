@@ -5063,15 +5063,39 @@ const chronicle_day: Operation = {
     date: { type: 'string', required: true, description: 'Day as YYYY-MM-DD.' },
     week: { type: 'boolean', description: 'Expand to the ISO week (Mon–Sun) containing the date.' },
     limit: { type: 'number', description: 'Max rows (default 200).' },
+    narrative: { type: 'boolean', description: 'Also return a prose day-by-day narrative.' },
   },
   handler: async (ctx, p) => {
-    return ctx.engine.getTimelineForDate(String(p.date), {
+    const rows = await ctx.engine.getTimelineForDate(String(p.date), {
       week: p.week === true,
       limit: typeof p.limit === 'number' ? p.limit : undefined,
       ...sourceScopeOpts(ctx),
     });
+    if (p.narrative === true) {
+      const { renderTimelineNarrative } = await import('./chronicle/narrative.ts');
+      return { date: String(p.date), narrative: renderTimelineNarrative(rows), events: rows };
+    }
+    return rows;
   },
   cliHints: { name: 'day', positional: ['date'] },
+};
+
+const chronicle_on_this_day: Operation = {
+  name: 'chronicle_on_this_day',
+  description:
+    'Life Chronicle: events from the same calendar day in PRIOR years ("on this day"). ' +
+    'CLI: `gbrain on-this-day [--date YYYY-MM-DD]`.',
+  scope: 'read',
+  params: {
+    date: { type: 'string', description: 'Anchor day YYYY-MM-DD (default today); matches its month-day in prior years.' },
+    limit: { type: 'number', description: 'Max rows (default 50).' },
+  },
+  handler: async (ctx, p) => ctx.engine.getOnThisDay({
+    date: typeof p.date === 'string' ? p.date : undefined,
+    limit: typeof p.limit === 'number' ? p.limit : undefined,
+    ...sourceScopeOpts(ctx),
+  }),
+  cliHints: { name: 'on-this-day' },
 };
 
 const chronicle_since: Operation = {
@@ -5332,7 +5356,7 @@ export const operations: Operation[] = [
   // v0.29: Salience + anomalies + recent transcripts
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.42.x (#2390): Life Chronicle timeline reads
-  chronicle_day, chronicle_since, chronicle_last_seen,
+  chronicle_day, chronicle_on_this_day, chronicle_since, chronicle_last_seen,
   ontology_get, ontology_propose, ontology_dimensions, ontology_conflicts,
   volunteer_chronicle, chronicle_backfill,
   // v0.43 (#2095): push-based context

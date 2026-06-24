@@ -3503,6 +3503,29 @@ export class PostgresEngine implements BrainEngine {
     return rows as unknown as ChronicleTimelineRow[];
   }
 
+  async getOnThisDay(opts?: { date?: string; limit?: number; sourceId?: string; sourceIds?: string[] }): Promise<ChronicleTimelineRow[]> {
+    const sql = this.sql;
+    const limit = opts?.limit ?? 50;
+    const target = opts?.date ? sql`${opts.date}::date` : sql`current_date`;
+    const rows = await sql`
+      SELECT te.date::text AS date, te.summary, te.detail, te.source,
+             te.page_id, p.slug AS page_slug,
+             te.event_page_id, ep.slug AS event_slug,
+             ep.effective_date::text AS effective_date,
+             ep.frontmatter->'event'->>'kind' AS kind
+      FROM timeline_entries te
+      JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
+      LEFT JOIN pages ep ON ep.id = te.event_page_id
+      WHERE EXTRACT(MONTH FROM te.date) = EXTRACT(MONTH FROM ${target})
+        AND EXTRACT(DAY FROM te.date) = EXTRACT(DAY FROM ${target})
+        AND te.date < ${target}
+        AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL)
+        ${this.chronicleSourceCond(opts)}
+      ORDER BY te.date DESC, te.id ASC
+      LIMIT ${limit}`;
+    return rows as unknown as ChronicleTimelineRow[];
+  }
+
   async getLastSeen(entitySlug: string, opts?: { asof?: string; sourceId?: string; sourceIds?: string[] }): Promise<LastSeenResult> {
     const sql = this.sql;
     // "Seen" = the entity's own page has a timeline row, OR an event's `who`

@@ -1392,6 +1392,8 @@ export interface BrainEngine {
   getTimelineForDate(date: string, opts?: ChronicleTimelineOpts): Promise<ChronicleTimelineRow[]>;
   /** Events/timeline rows on or after `date`, optionally filtered by event.kind. */
   getSince(date: string, opts?: ChronicleTimelineOpts): Promise<ChronicleTimelineRow[]>;
+  /** "On this day" — events from the same month-day in PRIOR years (default: today). */
+  getOnThisDay(opts?: { date?: string; limit?: number; sourceId?: string; sourceIds?: string[] }): Promise<ChronicleTimelineRow[]>;
   /** Most recent date an entity appears (its own page or an event's `who`). */
   getLastSeen(entitySlug: string, opts?: { asof?: string; sourceId?: string; sourceIds?: string[] }): Promise<LastSeenResult>;
   /**

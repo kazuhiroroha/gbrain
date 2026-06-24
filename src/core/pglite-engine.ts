@@ -3450,6 +3450,30 @@ export class PGLiteEngine implements BrainEngine {
     return result.rows as unknown as ChronicleTimelineRow[];
   }
 
+  async getOnThisDay(opts?: { date?: string; limit?: number; sourceId?: string; sourceIds?: string[] }): Promise<ChronicleTimelineRow[]> {
+    const limit = opts?.limit ?? 50;
+    const params: unknown[] = [];
+    let target: string;
+    if (opts?.date) { params.push(opts.date); target = `$${params.length}::date`; }
+    else { target = `current_date`; }
+    const where: string[] = [
+      `EXTRACT(MONTH FROM te.date) = EXTRACT(MONTH FROM ${target})`,
+      `EXTRACT(DAY FROM te.date) = EXTRACT(DAY FROM ${target})`,
+      `te.date < ${target}`,
+      `(te.event_page_id IS NULL OR ep.deleted_at IS NULL)`,
+    ];
+    this.pushChronicleSource(where, params, opts);
+    params.push(limit);
+    const result = await this.db.query(
+      `${PGLiteEngine.CHRONICLE_SELECT}
+       WHERE ${where.join(' AND ')}
+       ORDER BY te.date DESC, te.id ASC
+       LIMIT $${params.length}`,
+      params,
+    );
+    return result.rows as unknown as ChronicleTimelineRow[];
+  }
+
   async getLastSeen(entitySlug: string, opts?: { asof?: string; sourceId?: string; sourceIds?: string[] }): Promise<LastSeenResult> {
     const params: unknown[] = [entitySlug, `%${entitySlug}%`];
     const where: string[] = [
