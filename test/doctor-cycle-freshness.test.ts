@@ -87,6 +87,28 @@ describe('doctor checkCycleFreshness', () => {
     expect(result.message).toMatch(/never completed a full cycle/);
   });
 
+  test('empty owner-private placeholders are skipped for cycle freshness', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('business-shared', agoH(1));
+    await seed('owner-hamid-private', undefined);
+    await seed('owner-han-private', undefined);
+    const result = await checkCycleFreshness(engine, { nowMs: NOW });
+    expect(result.status).toBe('ok');
+    expect(result.message).toMatch(/owner-private placeholder/i);
+    expect(result.message).toContain('owner-hamid-private');
+    expect(result.message).toContain('owner-han-private');
+  });
+
+  test('empty owner-private placeholders do not mask stale cycle sources', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('business-shared', agoH(48));
+    await seed('owner-hamid-private', undefined);
+    const result = await checkCycleFreshness(engine, { nowMs: NOW });
+    expect(result.status).toBe('fail');
+    expect(result.message).toMatch(/business-shared/);
+    expect(result.message).not.toMatch(/owner-hamid-private.*never completed/);
+  });
+
   test('mixed sources: highest severity wins (fail > warn > ok)', async () => {
     await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
     await seed('fresh', agoH(1));     // ok

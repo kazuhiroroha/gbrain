@@ -1,7 +1,14 @@
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { extractTakesFromDb } from '../src/core/cycle/extract-takes.ts';
+import { extractTakesFromPages } from '../src/core/extract-takes-from-pages.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../src/core/takes-fence.ts';
+import {
+  configureGateway,
+  resetGateway,
+  __setChatTransportForTests,
+  type ChatResult,
+} from '../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 let alicePageId: number;
@@ -115,3 +122,58 @@ describe('extractTakesFromDb', () => {
     expect(allRowNums).toContain(3);
   });
 });
+
+describe('extractTakesFromPages', () => {
+  let routedEngine: PGLiteEngine;
+
+  beforeEach(async () => {
+    resetGateway();
+    __setChatTransportForTests(null);
+    routedEngine = new PGLiteEngine();
+    await routedEngine.connect({});
+    await routedEngine.initSchema();
+    await routedEngine.putPage('concepts/routed-takes-page', {
+      title: 'Routed takes page',
+      type: 'concept',
+      compiled_truth: `${'A routed page should produce claims. '.repeat(20)}\n\nThe business shared source has enough substance for extraction.`,
+    });
+  });
+
+  afterEach(async () => {
+    __setChatTransportForTests(null);
+    resetGateway();
+    await routedEngine.disconnect();
+  });
+
+  test('uses configured chat_model when no extractor model override is provided', async () => {
+    const seenModels: Array<string | undefined> = [];
+    configureGateway({
+      chat_model: 'openai:gpt-5.2',
+      env: { OPENAI_API_KEY: 'fake' },
+    });
+    __setChatTransportForTests(async (opts): Promise<ChatResult> => {
+      seenModels.push(opts.model);
+      return {
+        text: '[{"claim":"Business-shared extraction should honor configured chat routing","kind":"take","weight":0.65}]',
+        model: opts.model ?? 'default',
+        providerId: opts.model?.split(':')[0] ?? 'openai',
+        blocks: [{ type: 'text', text: '[{\"claim\":\"Business-shared extraction should honor configured chat routing\",\"kind\":\"take\",\"weight\":0.65}]' }],
+        stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      };
+    });
+
+    const result = await extractTakesFromPages(routedEngine, {
+      bootstrapEnabled: true,
+      maxPages: 1,
+      holder: 'han',
+      dryRun: true,
+    });
+
+    expect(result.llm_unavailable).toBe(false);
+    expect(result.pages_scanned).toBe(1);
+    expect(result.claims_extracted).toBe(1);
+    expect(seenModels).toEqual([undefined]);
+  });
+});
+

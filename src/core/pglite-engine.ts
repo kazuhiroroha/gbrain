@@ -2391,7 +2391,7 @@ export class PGLiteEngine implements BrainEngine {
   // ── v0.42.7 (#1696): link/timeline extraction freshness watermark ──
 
   /** Shared stale-for-extraction predicate (mirrors PostgresEngine). */
-  private buildStalePagesWhere(opts?: { sourceId?: string; versionTs?: string }): { where: string; params: unknown[] } {
+  private buildStalePagesWhere(opts?: { sourceId?: string; versionTs?: string; slugPrefix?: string }): { where: string; params: unknown[] } {
     const conds: string[] = ['deleted_at IS NULL'];
     const params: unknown[] = [];
     if (opts?.versionTs) {
@@ -2404,10 +2404,18 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.sourceId);
       conds.push(`source_id = $${params.length}`);
     }
+    if (opts?.slugPrefix) {
+      const prefix = opts.slugPrefix.replace(/\/+$/, '');
+      params.push(prefix);
+      const exactIdx = params.length;
+      params.push(`${prefix}/%`);
+      const likeIdx = params.length;
+      conds.push(`(slug = $${exactIdx} OR slug LIKE $${likeIdx})`);
+    }
     return { where: conds.join(' AND '), params };
   }
 
-  async countStalePagesForExtraction(opts?: { sourceId?: string; versionTs?: string }): Promise<number> {
+  async countStalePagesForExtraction(opts?: { sourceId?: string; versionTs?: string; slugPrefix?: string }): Promise<number> {
     const { where, params } = this.buildStalePagesWhere(opts);
     const { rows } = await this.db.query<{ count: number }>(
       `SELECT count(*)::int AS count FROM pages WHERE ${where}`,
@@ -2421,6 +2429,7 @@ export class PGLiteEngine implements BrainEngine {
     afterPageId?: number;
     sourceId?: string;
     versionTs?: string;
+    slugPrefix?: string;
   }): Promise<StalePageRow[]> {
     const { where, params } = this.buildStalePagesWhere(opts);
     let afterClause = '';

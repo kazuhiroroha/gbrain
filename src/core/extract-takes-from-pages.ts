@@ -1,5 +1,5 @@
 // src/core/extract-takes-from-pages.ts
-// v0.41.18.0 (A12, A24, T9). Haiku classifier loop over allowlisted page
+// v0.41.18.0 (A12, A24, T9). Gateway-routed classifier loop over allowlisted page
 // types — concept, atom, lore, briefing, writing, originals — extracts
 // gradeable claims and inserts them as takes fence rows.
 //
@@ -48,7 +48,7 @@ export interface ExtractTakesFromPagesOpts {
   maxPages?: number;
   /** Owner identifier for the inserted takes. Default 'system'. */
   holder?: string;
-  /** Model override; defaults to facts.extraction_model. */
+  /** Optional model override; when omitted, gateway.chat uses the configured chat_model. */
   model?: string;
   /** Progress hook called per page. */
   onProgress?: (done: number, total: number, claims: number) => void;
@@ -174,7 +174,7 @@ export async function extractTakesFromPages(
     let response: { text: string };
     try {
       response = await chat({
-        model: opts.model ?? 'anthropic:claude-haiku-4-5',
+        ...(opts.model ? { model: opts.model } : {}),
         system: CLASSIFIER_SYSTEM,
         messages: [
           {

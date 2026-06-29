@@ -51,6 +51,7 @@ import { isUndefinedColumnError } from '../core/utils.ts';
 // drift from what search actually filters.
 import { resolveHardExcludes, DEFAULT_HARD_EXCLUDES } from '../core/search/source-boost.ts';
 import { escapeLikePattern, buildVisibilityClause } from '../core/search/sql-ranking.ts';
+import type { ContentSanityAuditEvent } from '../core/audit/content-sanity-audit.ts';
 
 export interface Check {
   name: string;
@@ -2151,6 +2152,32 @@ export async function checkFactsEmbeddingWidthConsistency(engine: BrainEngine): 
  * Cost-bounded: total cap of 200 means a 20-source CEO brain pays
  * 20*10 = 200 selects rather than 20*50 = 1000.
  */
+function isOwnerPrivatePlaceholderSource(id: string): boolean {
+  return id === 'owner-hamid-private' || id === 'owner-han-private';
+}
+
+function isEmptyOwnerPrivatePlaceholderRow(source: { id: string; page_count?: string | number | null }): boolean {
+  if (!isOwnerPrivatePlaceholderSource(source.id)) return false;
+  const pageCount = Number(source.page_count);
+  return Number.isFinite(pageCount) && pageCount === 0;
+}
+
+async function isEmptyOwnerPrivatePlaceholderSourceRow(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<boolean> {
+  if (!isOwnerPrivatePlaceholderSource(sourceId)) return false;
+  try {
+    const rows = await engine.executeRaw<{ n: string | number }>(
+      `SELECT COUNT(*)::text AS n FROM pages WHERE source_id = $1`,
+      [sourceId],
+    );
+    return Number(rows[0]?.n ?? Number.NaN) === 0;
+  } catch {
+    return false;
+  }
+}
+
 export async function checkSourceRoutingHealth(engine: BrainEngine): Promise<Check> {
   try {
     const sources = await engine.executeRaw<{ id: string }>(
@@ -2161,13 +2188,18 @@ export async function checkSourceRoutingHealth(engine: BrainEngine): Promise<Che
     }
     const perSourceCap = Math.min(50, Math.ceil(200 / Math.max(1, sources.length)));
     const emptySources: string[] = [];
+    const emptyOwnerPrivatePlaceholders: string[] = [];
     for (const s of sources) {
       const rows = await engine.executeRaw<{ n: string }>(
         `SELECT COUNT(*)::text AS n FROM pages WHERE source_id = $1 LIMIT $2`,
         [s.id, perSourceCap],
       );
       if (Number(rows[0]?.n ?? 0) === 0) {
-        emptySources.push(s.id);
+        if (isOwnerPrivatePlaceholderSource(s.id)) {
+          emptyOwnerPrivatePlaceholders.push(s.id);
+        } else {
+          emptySources.push(s.id);
+        }
       }
     }
     if (emptySources.length > 0) {
@@ -2179,6 +2211,16 @@ export async function checkSourceRoutingHealth(engine: BrainEngine): Promise<Che
           `If you've recently run \`gbrain import --source-id <id>\` against these, the writes may have ` +
           `silently fallen to the default source pre-v0.37.7.0. Re-run with --source-id; verify via ` +
           `\`gbrain sources current --json\`.`,
+      };
+    }
+    if (emptyOwnerPrivatePlaceholders.length > 0) {
+      return {
+        name: 'source_routing_health',
+        status: 'ok',
+        message:
+          `Multi-source brain (${sources.length} non-default source(s)); ` +
+          `${emptyOwnerPrivatePlaceholders.length} owner-private placeholder source(s) intentionally empty: ` +
+          `${emptyOwnerPrivatePlaceholders.join(', ')}`,
       };
     }
     return {
@@ -3340,10 +3382,14 @@ export async function checkSyncFreshness(
       last_commit: string | null;
       chunker_version: string | null;
       newest_content_at: Date | null;
+      page_count?: string | number | null;
     }>(
       // v0.41.32.0: newest_content_at feeds the REMOTE (non-localOnly) lag so
       // doctorReportRemote never shells out to git on a DB-supplied local_path.
-      `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL`,
+      `SELECT s.id, s.name, s.local_path, s.last_sync_at, s.last_commit, s.chunker_version, s.newest_content_at,
+              (SELECT COUNT(*)::text FROM pages p WHERE p.source_id = s.id) AS page_count
+         FROM sources s
+        WHERE s.local_path IS NOT NULL`,
     );
 
     if (sources.length === 0) {
@@ -3410,6 +3456,7 @@ export async function checkSyncFreshness(
     // bucket). Empty when nothing is syncing — keeps the steady-state messages
     // byte-for-byte unchanged.
     const inProgress: string[] = [];
+    const emptyOwnerPrivatePlaceholders: string[] = [];
     let liveSyncSnap: (sourceId: string) => Promise<{ holder_pid: number; holder_host: string } | null> =
       async () => null;
     try {
@@ -3434,6 +3481,12 @@ export async function checkSyncFreshness(
       const display = source.name && source.name !== source.id
         ? `'${source.id}' (${source.name})`
         : `'${source.id}'`;
+
+      if (isEmptyOwnerPrivatePlaceholderRow(source)) {
+        emptyOwnerPrivatePlaceholders.push(source.id);
+        synced_recently_count++;
+        continue;
+      }
 
       // BUG 4: actively syncing (live lock) → healthy, count as synced_recently
       // and skip the staleness checks. Keeps the 3-bucket invariant intact.
@@ -3532,12 +3585,15 @@ export async function checkSyncFreshness(
     // BUG 4: append in-progress context when any source is actively syncing.
     // Empty otherwise, so steady-state messages are byte-for-byte unchanged.
     const inProgressNote = inProgress.length ? `. ${inProgress.join('; ')}` : '';
+    const placeholderNote = emptyOwnerPrivatePlaceholders.length
+      ? `. ${emptyOwnerPrivatePlaceholders.length} owner-private placeholder source(s) intentionally empty: ${emptyOwnerPrivatePlaceholders.join(', ')}`
+      : '';
 
     if (hasFailures) {
       return {
         name: 'sync_freshness',
         status: 'fail',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` for each stale source${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` for each stale source${inProgressNote}${placeholderNote}`,
         details,
       };
     }
@@ -3545,7 +3601,7 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'warn',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` to refresh${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` to refresh${inProgressNote}${placeholderNote}`,
         details,
       };
     }
@@ -3556,7 +3612,7 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'ok',
-        message: `All ${sources.length} federated source(s) up to date (no new commits since last sync)${inProgressNote}`,
+        message: `All ${sources.length} federated source(s) up to date (no new commits since last sync)${inProgressNote}${placeholderNote}`,
         details,
       };
     }
@@ -3564,14 +3620,14 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'ok',
-        message: `${sources.length} federated source(s): ${synced_recently_count} synced recently, ${unchanged_count} unchanged since last sync${inProgressNote}`,
+        message: `${sources.length} federated source(s): ${synced_recently_count} synced recently, ${unchanged_count} unchanged since last sync${inProgressNote}${placeholderNote}`,
         details,
       };
     }
     return {
       name: 'sync_freshness',
       status: 'ok',
-      message: `All ${sources.length} federated source(s) synced recently${inProgressNote}`,
+      message: `All ${sources.length} federated source(s) synced recently${inProgressNote}${placeholderNote}`,
       details,
     };
   } catch (e) {
@@ -3733,6 +3789,7 @@ export async function checkCycleFreshness(
     const now = opts?.nowMs ?? Date.now();
 
     const issues: string[] = [];
+    const emptyOwnerPrivatePlaceholders: string[] = [];
     let hasWarnings = false;
     let hasFailures = false;
 
@@ -3740,6 +3797,11 @@ export async function checkCycleFreshness(
       const display = source.name && source.name !== source.id
         ? `'${source.id}' (${source.name})`
         : `'${source.id}'`;
+      if (await isEmptyOwnerPrivatePlaceholderSourceRow(engine, source.id)) {
+        emptyOwnerPrivatePlaceholders.push(source.id);
+        continue;
+      }
+
       const raw = source.config?.last_full_cycle_at;
       if (typeof raw !== 'string') {
         issues.push(`Source ${display} has never completed a full cycle`);
@@ -3768,24 +3830,28 @@ export async function checkCycleFreshness(
       }
     }
 
+    const placeholderNote = emptyOwnerPrivatePlaceholders.length
+      ? `. ${emptyOwnerPrivatePlaceholders.length} owner-private placeholder source(s) intentionally empty: ${emptyOwnerPrivatePlaceholders.join(', ')}`
+      : '';
+
     if (hasFailures) {
       return {
         name: 'cycle_freshness',
         status: 'fail',
-        message: `${issues.join('; ')}. Run \`gbrain dream --source <id>\` for each stale source, or start \`gbrain autopilot\`.`,
+        message: `${issues.join('; ')}. Run \`gbrain dream --source <id>\` for each stale source, or start \`gbrain autopilot\`${placeholderNote}.`,
       };
     }
     if (hasWarnings) {
       return {
         name: 'cycle_freshness',
         status: 'warn',
-        message: `${issues.join('; ')}.`,
+        message: `${issues.join('; ')}${placeholderNote}.`,
       };
     }
     return {
       name: 'cycle_freshness',
       status: 'ok',
-      message: `All ${sources.length} federated source(s) cycled recently`,
+      message: `All ${sources.length} federated source(s) cycled recently${placeholderNote}`,
     };
   } catch (e) {
     return {
@@ -6257,6 +6323,10 @@ export async function buildChecks(
   try {
     const { readRecentContentSanityEvents, summarizeContentSanityEvents } =
       await import('../core/audit/content-sanity-audit.ts');
+    const { loadConfig: _loadCfg } = await import('../core/config.ts');
+    const _cfg = _loadCfg();
+    const bytesWarn = _cfg?.content_sanity?.bytes_warn ?? 50_000;
+    const bytesBlock = _cfg?.content_sanity?.bytes_block ?? 500_000;
     const events = readRecentContentSanityEvents(7);
     if (events.length === 0) {
       checks.push({
@@ -6265,36 +6335,28 @@ export async function buildChecks(
         message: 'No content-sanity events in last 7 days (audit JSONL is local to this host; share GBRAIN_AUDIT_DIR for multi-host visibility)',
       });
     } else {
-      const summary = summarizeContentSanityEvents(events);
+      const active = await summarizeActiveContentSanityEvents(engine, events, { bytesWarn, bytesBlock });
+      const summary = summarizeContentSanityEvents(active.events);
       const topPatterns = summary.top_patterns.slice(0, 3).map(p => `${p.name}=${p.count}`).join(', ');
       const topSources = Object.entries(summary.by_source)
         .sort((a, b) => b[1] - a[1])
         .slice(0, 3)
         .map(([s, n]) => `${s}=${n}`)
         .join(', ');
-      // Audit events are evidence, not automatically breakage. A large code
-      // source can legitimately emit many WARN events (oversize/markup-heavy)
-      // while remaining searchable and intentionally flagged. Fail on hard
-      // dispositions (content actually blocked or hidden); warn on soft
-      // dispositions or volume. This keeps doctor from treating expected
-      // code-corpus telemetry as an unhealthy brain.
-      //
-      // v0.42 renamed the hard path: a rejected page emits `reject` and a
-      // quarantined (hidden) junk page emits `quarantine`; `hard_block` is now
-      // only the pre-v0.42 legacy alias. Counting `hard_block` alone let fresh
-      // junk-ingest evidence (`reject`/`quarantine`) clear as `ok` whenever
-      // fewer than 10 events landed. `flag` is a warn disposition (still
-      // searchable, agent warned on retrieval), so it joins `soft_block`.
+      // Audit events are evidence, not automatically breakage. Doctor first
+      // resolves append-only audit rows against current page state so old
+      // oversized pages that have since been split/cleaned stop producing
+      // persistent noise. Hard dispositions still fail even when no page landed.
       const hardBlocked =
         summary.by_type.hard_block + summary.by_type.reject + summary.by_type.quarantine;
       const softBlocked = summary.by_type.soft_block + summary.by_type.flag;
       const status: 'ok' | 'warn' | 'fail' =
         hardBlocked > 0 ? 'fail' :
-          (softBlocked > 0 || events.length >= 10) ? 'warn' : 'ok';
+          softBlocked > 0 ? 'warn' : 'ok';
       checks.push({
         name: 'content_sanity_audit_recent',
         status,
-        message: `${events.length} events (hard=${hardBlocked} [hard_block=${summary.by_type.hard_block} reject=${summary.by_type.reject} quarantine=${summary.by_type.quarantine}] soft=${softBlocked} [soft_block=${summary.by_type.soft_block} flag=${summary.by_type.flag}] warn=${summary.by_type.warn})${topPatterns ? ', patterns: ' + topPatterns : ''}${topSources ? ', sources: ' + topSources : ''}. (Local audit only — multi-host operators set GBRAIN_AUDIT_DIR.)`,
+        message: `${active.events.length} active of ${events.length} recent events (resolved=${active.resolved_count}; hard=${hardBlocked} [hard_block=${summary.by_type.hard_block} reject=${summary.by_type.reject} quarantine=${summary.by_type.quarantine}] soft=${softBlocked} [soft_block=${summary.by_type.soft_block} flag=${summary.by_type.flag}] warn=${summary.by_type.warn})${topPatterns ? ', patterns: ' + topPatterns : ''}${topSources ? ', sources: ' + topSources : ''}. (Local audit only — multi-host operators set GBRAIN_AUDIT_DIR.)`,
       });
     }
   } catch (err) {
@@ -7244,6 +7306,70 @@ export async function buildChecks(
  * test/doctor-behavioral.test.ts for the in-process seam coverage and
  * test/doctor-cli-smoke.test.ts for the subprocess wrapper coverage.
  */
+
+export interface ActiveContentSanitySummary {
+  events: ContentSanityAuditEvent[];
+  resolved_count: number;
+}
+
+/**
+ * Audit JSONL is append-only evidence; doctor should only warn on events that
+ * still describe the current page state. This filters out old oversize noise
+ * after a page was split, deleted, or otherwise brought below policy.
+ */
+export async function summarizeActiveContentSanityEvents(
+  engine: BrainEngine,
+  events: ReadonlyArray<ContentSanityAuditEvent>,
+  opts: { bytesWarn?: number; bytesBlock?: number } = {},
+): Promise<ActiveContentSanitySummary> {
+  const bytesWarn = opts.bytesWarn ?? 50_000;
+  const bytesBlock = opts.bytesBlock ?? 500_000;
+  const active: ContentSanityAuditEvent[] = [];
+  let resolved_count = 0;
+
+  for (const ev of events) {
+    if (ev.event_type === 'hard_block' || ev.event_type === 'reject' || ev.event_type === 'quarantine') {
+      active.push(ev);
+      continue;
+    }
+
+    const rows = await engine.executeRaw<{
+      bytes: string | number | null;
+      content_flag: string | null;
+      embed_skip: string | null;
+      quarantine: string | null;
+    }>(
+      `SELECT
+          (octet_length(COALESCE(compiled_truth, '')) + octet_length(COALESCE(timeline, '')))::text AS bytes,
+          frontmatter->>'content_flag' AS content_flag,
+          frontmatter->>'embed_skip' AS embed_skip,
+          frontmatter->>'quarantine' AS quarantine
+         FROM pages
+        WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL
+        LIMIT 1`,
+      [ev.source_id, ev.slug],
+    );
+    const row = rows[0];
+    if (!row) {
+      resolved_count++;
+      continue;
+    }
+
+    const currentBytes = Number(row.bytes ?? 0);
+    const hasMarker = Boolean(row.content_flag || row.embed_skip || row.quarantine);
+    const remainsActive = ev.event_type === 'soft_block'
+      ? (hasMarker || currentBytes > bytesBlock)
+      : (hasMarker || currentBytes > bytesWarn);
+    if (remainsActive) {
+      active.push(ev);
+    } else {
+      resolved_count++;
+    }
+  }
+
+  return { events: active, resolved_count };
+}
+
 export async function runDoctor(
   engine: BrainEngine | null,
   args: string[],

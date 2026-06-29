@@ -466,6 +466,30 @@ describe('v0.32.4 — sync_freshness check', () => {
     expect(result.message).toContain('gbrain sync --source <id>');
   });
 
+  test('empty owner-private placeholders do not make sync freshness stale', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'business-shared', name: '', local_path: '/tmp/business', last_sync_at: agoMs(60 * 1000) },
+      { id: 'owner-hamid-private', name: 'Hamid private memory', local_path: '/tmp/owner-hamid-private', last_sync_at: agoMs(7 * 24 * 60 * 60 * 1000), page_count: '0' },
+      { id: 'owner-han-private', name: 'Han private memory', local_path: '/tmp/owner-han-private', last_sync_at: agoMs(7 * 24 * 60 * 60 * 1000), page_count: '0' },
+    ]));
+    expect(result.status).toBe('ok');
+    expect(result.message).toMatch(/owner-private placeholder/i);
+    expect(result.message).toContain('owner-hamid-private');
+    expect(result.message).toContain('owner-han-private');
+  });
+
+  test('empty owner-private placeholders do not mask stale populated sources', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'business-shared', name: '', local_path: '/tmp/business', last_sync_at: agoMs(5 * 24 * 60 * 60 * 1000), page_count: '222' },
+      { id: 'owner-hamid-private', name: 'Hamid private memory', local_path: '/tmp/owner-hamid-private', last_sync_at: agoMs(7 * 24 * 60 * 60 * 1000), page_count: '0' },
+    ]));
+    expect(result.status).toBe('fail');
+    expect(result.message).toContain('business-shared');
+    expect(result.message).not.toMatch(/owner-hamid-private.*stale|owner-hamid-private.*synced/i);
+  });
+
   test('last_sync_at > 72h ago → fail with day-rounded "Nd ago"', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     const result = await checkSyncFreshness(makeStubEngine([

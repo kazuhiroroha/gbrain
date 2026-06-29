@@ -175,6 +175,55 @@ export interface ExtractedTimelineEntry {
   detail?: string;
 }
 
+interface DbTimelineEntry {
+  date: string;
+  source: string;
+  summary: string;
+  detail?: string;
+}
+
+function normalizeTimelineDate(value: unknown): string {
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return String(value).slice(0, 10);
+}
+
+function timelineConflictKey(date: unknown, source: unknown, summary: unknown): string {
+  return `${normalizeTimelineDate(date)}::${String(source ?? '')}::${String(summary ?? '')}`;
+}
+
+function dbTimelineEntryFromCandidate(entry: { date: string; summary: string; detail?: string }): DbTimelineEntry {
+  const match = entry.summary.match(/^(.+?)\s+[—–-]\s+(.+)$/);
+  if (!match) {
+    return { date: entry.date, source: '', summary: entry.summary, detail: entry.detail || '' };
+  }
+  return {
+    date: entry.date,
+    source: match[1].trim(),
+    summary: match[2].trim(),
+    detail: entry.detail || '',
+  };
+}
+
+
+function normalizeSlugPrefixArg(value: string): string {
+  return value.trim().replace(/\*+$/, '').replace(/\/+$/, '');
+}
+
+async function existingTimelineKeysForPage(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+): Promise<Set<string>> {
+  const rows = await engine.executeRaw<{ date: string; source: string; summary: string }>(
+    `SELECT te.date::text AS date, te.source, te.summary
+     FROM timeline_entries te
+     JOIN pages p ON p.id = te.page_id
+     WHERE p.slug = $1 AND p.source_id = $2`,
+    [slug, sourceId],
+  );
+  return new Set(rows.map(r => timelineConflictKey(r.date, r.source, r.summary)));
+}
+
 interface ExtractResult {
   links_created: number;
   timeline_entries_created: number;
@@ -516,6 +565,11 @@ export interface ExtractOpts {
    */
   slugs?: string[];
   /**
+   * Source id for FS extraction writes. When omitted, batch rows default to
+   * 'default' for backward compatibility.
+   */
+  sourceId?: string;
+  /**
    * v0.41.15.0 (D9): in-process parallel file workers for the fs-walk
    * loops. Default 1. PGLite engines clamp to 1 (single-writer; though
    * extract is mostly CPU-bound, the DB batch flush still hits the
@@ -574,7 +628,7 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
       // Nothing changed — skip entirely.
       return result;
     }
-    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode, workers, opts.signal);
+    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode, workers, opts.signal, opts.sourceId);
     result.links_created = r.links_created;
     result.timeline_entries_created = r.timeline_created;
     result.pages_processed = r.pages;
@@ -583,12 +637,12 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
 
   // Full walk path: CLI `gbrain extract` or first-run.
   if (opts.mode === 'links' || opts.mode === 'all') {
-    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode, workers, opts.signal);
+    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode, workers, opts.signal, opts.sourceId);
     result.links_created = r.created;
     result.pages_processed = r.pages;
   }
   if (opts.mode === 'timeline' || opts.mode === 'all') {
-    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode, workers, opts.signal);
+    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode, workers, opts.signal, opts.sourceId);
     result.timeline_entries_created = r.created;
     result.pages_processed = Math.max(result.pages_processed, r.pages);
   }
@@ -636,11 +690,16 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
     }
     const sidIdx = args.indexOf('--source-id');
     const staleSourceId = (sidIdx >= 0 && sidIdx + 1 < args.length) ? args[sidIdx + 1] : undefined;
+    const slugPrefixIdx = args.indexOf('--slug-prefix');
+    const staleSlugPrefix = (slugPrefixIdx >= 0 && slugPrefixIdx + 1 < args.length)
+      ? normalizeSlugPrefixArg(args[slugPrefixIdx + 1])
+      : undefined;
     await extractStaleFromDB(engine, {
       dryRun: args.includes('--dry-run'),
       jsonMode: args.includes('--json'),
       includeFrontmatter: args.includes('--include-frontmatter'),
       sourceIdFilter: staleSourceId,
+      slugPrefixFilter: staleSlugPrefix,
       catchUp: args.includes('--catch-up'),
     });
     return;
@@ -729,10 +788,11 @@ Extraction (existing):
   gbrain extract <timeline|all> --from-meetings
 
 Incremental sweep (v0.42.7):
-  gbrain extract --stale [--source-id <id>] [--catch-up] [--dry-run] [--json]
+  gbrain extract --stale [--source-id <id>] [--slug-prefix <prefix>] [--catch-up] [--dry-run] [--json]
       Re-extract links + timeline ONLY for pages whose extraction is stale
       (never extracted, edited since, or extractor bumped). DB-source; safe to
-      cron. --catch-up loops past the 30-min wall-clock budget until 0 remain.
+      cron. --slug-prefix scopes to one slug subtree. --catch-up loops past the
+      30-min wall-clock budget until 0 remain.
 
 Inspection (v0.42):
   gbrain extract --explain <kind> [--json]
@@ -812,9 +872,15 @@ Status (v0.42):
   // FS source needs a brain dir. When --dir wasn't passed, resolve from
   // sources(local_path) — same path `gbrain sync` uses — instead of
   // silently walking cwd. See the brainDir comment above for the footgun.
+  let fsSourceId = sourceIdFilter;
   if (source === 'fs' && !explicitDir) {
-    const { getDefaultSourcePath } = await import('../core/source-resolver.ts');
-    const configured = await getDefaultSourcePath(engine);
+    const { resolveSourceId } = await import('../core/source-resolver.ts');
+    fsSourceId = await resolveSourceId(engine, sourceIdFilter ?? null);
+    const rows = await engine.executeRaw<{ local_path: string | null }>(
+      `SELECT local_path FROM sources WHERE id = $1`,
+      [fsSourceId],
+    );
+    const configured = rows[0]?.local_path ?? (fsSourceId === 'default' ? await engine.getConfig('sync.repo_path') : null);
     if (configured) {
       brainDir = configured;
     } else {
@@ -915,6 +981,7 @@ Status (v0.42):
         dryRun,
         jsonMode,
         workers,
+        sourceId: fsSourceId,
       });
     }
   } catch (e) {
@@ -953,6 +1020,7 @@ async function extractForSlugs(
   // shared counter increments atomic.
   workers: number = 1,
   signal?: AbortSignal,
+  sourceId?: string,
 ): Promise<{ links_created: number; timeline_created: number; pages: number }> {
   // Build the full slug set for link resolution (fast: just readdir, no file reads)
   const allFiles = walkMarkdownFiles(brainDir);
@@ -1033,7 +1101,7 @@ async function extractForSlugs(
               if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
               linksCreated++;
             } else {
-              linkBatch.push(link);
+              linkBatch.push(sourceId ? { ...link, from_source_id: sourceId, to_source_id: sourceId, origin_source_id: sourceId } : link);
               if (linkBatch.length >= BATCH_SIZE) await flushLinks();
             }
           }
@@ -1046,7 +1114,7 @@ async function extractForSlugs(
               if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
               timelineCreated++;
             } else {
-              timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+              timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail, source_id: sourceId });
               if (timelineBatch.length >= BATCH_SIZE) await flushTimeline();
             }
           }
@@ -1075,6 +1143,7 @@ async function extractLinksFromDir(
   // v0.41.15.0 (T7): in-process worker count. Default 1.
   workers: number = 1,
   signal?: AbortSignal,
+  sourceId?: string,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
   const allSlugs = new Set(files.map(f => pathToSlug(f.relPath)));
@@ -1131,7 +1200,7 @@ async function extractLinksFromDir(
             if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
             created++;
           } else {
-            batch.push(link);
+            batch.push(sourceId ? { ...link, from_source_id: sourceId, to_source_id: sourceId, origin_source_id: sourceId } : link);
             if (batch.length >= BATCH_SIZE) await flush();
           }
         }
@@ -1154,6 +1223,7 @@ async function extractTimelineFromDir(
   // v0.41.15.0 (T7): in-process worker count. Default 1.
   workers: number = 1,
   signal?: AbortSignal,
+  sourceId?: string,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
 
@@ -1200,7 +1270,7 @@ async function extractTimelineFromDir(
             if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
             created++;
           } else {
-            batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+            batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail, source_id: sourceId });
             if (batch.length >= BATCH_SIZE) await flush();
           }
         }
@@ -1532,26 +1602,29 @@ async function extractTimelineFromDB(
     }
 
     const fullContent = page.compiled_truth + '\n' + page.timeline;
-    const entries = parseTimelineEntries(fullContent);
+    const entries = parseTimelineEntries(fullContent).map(dbTimelineEntryFromCandidate);
+    const existingTimelineKeys = dryRun ? await existingTimelineKeysForPage(engine, slug, source_id) : null;
 
     for (const entry of entries) {
       if (dryRunSeen) {
-        const key = `${source_id}::${slug}::${entry.date}::${entry.summary}`;
+        const conflictKey = timelineConflictKey(entry.date, entry.source, entry.summary);
+        if (existingTimelineKeys?.has(conflictKey)) continue;
+        const key = `${source_id}::${slug}::${conflictKey}`;
         if (dryRunSeen.has(key)) continue;
         dryRunSeen.add(key);
         if (jsonMode) {
           process.stdout.write(JSON.stringify({
-            action: 'add_timeline', slug, source_id, date: entry.date,
+            action: 'add_timeline', slug, source_id, date: entry.date, source: entry.source,
             summary: entry.summary, ...(entry.detail ? { detail: entry.detail } : {}),
           }) + '\n');
         } else {
-          console.log(`  ${slug}: ${entry.date} — ${entry.summary}`);
+          console.log(`  ${slug}: ${entry.date} — ${entry.source ? `${entry.source} — ` : ''}${entry.summary}`);
         }
         created++;
       } else {
         // v0.32.8 F4: thread source_id so the JOIN matches the right page
         // when two sources share the same slug.
-        batch.push({ slug, date: entry.date, summary: entry.summary, detail: entry.detail || '', source_id });
+        batch.push({ slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail || '', source_id });
         if (batch.length >= BATCH_SIZE) await flush();
       }
     }
@@ -1590,19 +1663,21 @@ async function extractStaleFromDB(
     jsonMode: boolean;
     includeFrontmatter: boolean;
     sourceIdFilter?: string;
+    slugPrefixFilter?: string;
     catchUp: boolean;
   },
 ): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number }> {
-  const { dryRun, jsonMode, includeFrontmatter, sourceIdFilter, catchUp } = opts;
+  const { dryRun, jsonMode, includeFrontmatter, sourceIdFilter, slugPrefixFilter, catchUp } = opts;
   const versionTs = LINK_EXTRACTOR_VERSION_TS;
 
   // Pre-flight count — cheap indexed COUNT. dry-run reports and returns.
-  const totalStale = await engine.countStalePagesForExtraction({ sourceId: sourceIdFilter, versionTs });
+  const staleFilter = { sourceId: sourceIdFilter, slugPrefix: slugPrefixFilter, versionTs };
+  const totalStale = await engine.countStalePagesForExtraction(staleFilter);
   if (dryRun) {
     if (jsonMode) {
-      process.stdout.write(JSON.stringify({ action: 'extract_stale_dry_run', stale_pages: totalStale }) + '\n');
+      process.stdout.write(JSON.stringify({ action: 'extract_stale_dry_run', stale_pages: totalStale, ...(slugPrefixFilter ? { slug_prefix: slugPrefixFilter } : {}) }) + '\n');
     } else {
-      console.log(`(dry run) ${totalStale} page(s) need link/timeline extraction. Run without --dry-run to extract.`);
+      console.log(`(dry run) ${totalStale} page(s) need link/timeline extraction${slugPrefixFilter ? ` under ${slugPrefixFilter}` : ''}. Run without --dry-run to extract.`);
     }
     return { linksCreated: 0, timelineCreated: 0, pagesProcessed: 0, staleRemaining: totalStale };
   }
@@ -1639,7 +1714,7 @@ async function extractStaleFromDB(
 
   for (;;) {
     const rows = await engine.listStalePagesForExtraction({
-      batchSize: STALE_BATCH_SIZE, afterPageId, sourceId: sourceIdFilter, versionTs,
+      batchSize: STALE_BATCH_SIZE, afterPageId, sourceId: sourceIdFilter, slugPrefix: slugPrefixFilter, versionTs,
     });
     if (rows.length === 0) break;
 
@@ -1700,7 +1775,7 @@ async function extractStaleFromDB(
   }
 
   progress.finish();
-  const staleRemaining = await engine.countStalePagesForExtraction({ sourceId: sourceIdFilter, versionTs });
+  const staleRemaining = await engine.countStalePagesForExtraction(staleFilter);
 
   if (!jsonMode) {
     console.log(`Extract --stale: ${linksCreated} link(s) + ${timelineCreated} timeline entr(ies) from ${pagesProcessed} page(s).`);
@@ -1710,7 +1785,7 @@ async function extractStaleFromDB(
   } else {
     process.stdout.write(JSON.stringify({
       action: 'extract_stale_done', links_created: linksCreated, timeline_created: timelineCreated,
-      pages_processed: pagesProcessed, stale_remaining: staleRemaining, budget_hit: budgetHit,
+      pages_processed: pagesProcessed, stale_remaining: staleRemaining, budget_hit: budgetHit, ...(slugPrefixFilter ? { slug_prefix: slugPrefixFilter } : {}),
     }) + '\n');
   }
   return { linksCreated, timelineCreated, pagesProcessed, staleRemaining };

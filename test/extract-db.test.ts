@@ -174,6 +174,53 @@ describe('gbrain extract timeline --source db', () => {
     expect(entries.length).toBe(1);
   });
 
+  test('preserves parsed source labels in DB-source batch inserts', async () => {
+    await engine.putPage('people/alice', {
+      type: 'person', title: 'Alice', compiled_truth: '',
+      timeline: '- **2026-01-15** | Task recorded — Alice joined the project',
+    });
+
+    await runExtract(engine, ['timeline', '--source', 'db']);
+
+    const rows = await engine.executeRaw<{ source: string; summary: string }>(
+      `SELECT te.source, te.summary
+       FROM timeline_entries te
+       JOIN pages p ON p.id = te.page_id
+       WHERE p.slug = $1`,
+      ['people/alice'],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].source).toBe('Task recorded');
+    expect(rows[0].summary).toBe('Alice joined the project');
+  });
+
+  test('dry-run reports only timeline rows that would survive DB conflict checks', async () => {
+    await engine.putPage('people/alice', {
+      type: 'person', title: 'Alice', compiled_truth: '',
+      timeline: '- **2026-01-15** | Task recorded — Alice joined the project',
+    });
+
+    await runExtract(engine, ['timeline', '--source', 'db']);
+
+    const lines: string[] = [];
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      const str = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8');
+      lines.push(str);
+      return true;
+    }) as any;
+    try {
+      await runExtract(engine, ['timeline', '--source', 'db', '--dry-run', '--json']);
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+
+    const actionLines = lines.filter(l => l.includes('\"action\":\"add_timeline\"'));
+    expect(actionLines).toHaveLength(0);
+    const entries = await engine.getTimeline('people/alice');
+    expect(entries).toHaveLength(1);
+  });
+
   test('skips invalid dates', async () => {
     await engine.putPage('people/alice', {
       type: 'person', title: 'Alice', compiled_truth: '',
@@ -247,5 +294,48 @@ describe('gbrain extract all --source db', () => {
     expect(links.length).toBe(1);
     const entries = await engine.getTimeline('companies/acme');
     expect(entries.length).toBe(1);
+  });
+});
+
+describe('gbrain extract --stale --slug-prefix', () => {
+  beforeEach(truncateAll);
+
+  test('dry-run counts only stale pages under the requested slug prefix', async () => {
+    await engine.putPage('org-vault/historical-group-context/summary', {
+      type: 'note', title: 'Historical Summary',
+      compiled_truth: '[[org-vault/departments/emlak]] historical context.',
+      timeline: '',
+    });
+    await engine.putPage('docs/other-stale-page', {
+      type: 'note', title: 'Other',
+      compiled_truth: 'Other changed page.',
+      timeline: '',
+    });
+
+    const lines: string[] = [];
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      const str = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8');
+      lines.push(str);
+      return true;
+    }) as any;
+
+    try {
+      await runExtract(engine, [
+        '--stale',
+        '--slug-prefix', 'org-vault/historical-group-context',
+        '--dry-run',
+        '--json',
+      ]);
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+
+    const parsed = JSON.parse(lines.find(l => l.trim().startsWith('{'))!.trim());
+    expect(parsed).toMatchObject({
+      action: 'extract_stale_dry_run',
+      stale_pages: 1,
+      slug_prefix: 'org-vault/historical-group-context',
+    });
   });
 });

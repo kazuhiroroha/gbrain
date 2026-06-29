@@ -71,6 +71,35 @@ describe('checkSourceRoutingHealth (#1167)', () => {
     expect(r.message).toMatch(/--source-id/);
     expect(r.message).toMatch(/gbrain sources current/);
   });
+
+  test('empty owner-private placeholder sources → ok', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name)
+       VALUES ('owner-hamid-private', 'Hamid private memory'),
+              ('owner-han-private', 'Han private memory')`,
+    );
+    const r = await checkSourceRoutingHealth(engine);
+    expect(r.status).toBe('ok');
+    expect(r.message).toMatch(/owner-private placeholder/i);
+    expect(r.message).toMatch(/owner-hamid-private/);
+    expect(r.message).toMatch(/owner-han-private/);
+    expect(r.message).not.toMatch(/--source-id/);
+  });
+
+  test('empty owner-private placeholders do not mask other empty sources', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name)
+       VALUES ('owner-hamid-private', 'Hamid private memory'),
+              ('owner-han-private', 'Han private memory'),
+              ('lonely', 'lonely')`,
+    );
+    const r = await checkSourceRoutingHealth(engine);
+    expect(r.status).toBe('warn');
+    expect(r.message).toMatch(/lonely/);
+    expect(r.message).not.toMatch(/owner-hamid-private/);
+    expect(r.message).not.toMatch(/owner-han-private/);
+    expect(r.message).toMatch(/--source-id/);
+  });
 });
 
 describe('checkOauthConfidentialHealth (#1166)', () => {
