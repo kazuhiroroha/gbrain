@@ -42,6 +42,7 @@ async function truncateAll() {
   for (const t of ['content_chunks', 'links', 'tags', 'raw_data', 'timeline_entries', 'page_versions', 'ingest_log', 'pages']) {
     await (engine as any).db.exec(`DELETE FROM ${t}`);
   }
+  await (engine as any).db.exec(`DELETE FROM sources WHERE id <> 'default'`);
 }
 
 const personPage = (title: string, body = ''): PageInput => ({
@@ -157,6 +158,35 @@ title: Alice
     expect(after2.length).toBe(2);
 
     expect(elapsedMs).toBeLessThan(2000);
+  });
+});
+
+describe('gbrain extract all --source fs --source-id', () => {
+  test('writes links and timeline rows into the configured non-default source', async () => {
+    const sourcePath = brainDir.replace(/'/g, "''");
+    await engine.executeRaw(
+      "INSERT INTO sources (id, name, local_path) " +
+      "VALUES ('business-shared', 'business-shared', '" + sourcePath + "') " +
+      "ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path",
+    );
+    await engine.executeRaw(
+      "INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline) VALUES " +
+      "('people/alice', 'business-shared', 'person', 'Alice', '', ''), " +
+      "('people/bob', 'business-shared', 'person', 'Bob', '', '')",
+    );
+
+    writeFile('people/alice.md', '---\ntitle: Alice\n---\n\n[[../people/bob|Bob]] helped.\n\n## Timeline\n\n- **2026-06-27** | source — Worked with [[../people/bob|Bob]]\n');
+    writeFile('people/bob.md', '---\ntitle: Bob\n---\n');
+
+    await runExtract(engine, ['all', '--dir', brainDir, '--source-id', 'business-shared']);
+
+    const links = await engine.getLinks('people/alice', { sourceId: 'business-shared' });
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ to_slug: 'people/bob' });
+
+    const timeline = await engine.getTimeline('people/alice', { sourceId: 'business-shared' });
+    expect(timeline).toHaveLength(1);
+    expect(new Date(timeline[0].date).toISOString().slice(0, 10)).toBe('2026-06-27');
   });
 });
 

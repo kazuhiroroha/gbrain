@@ -90,5 +90,6 @@
     "contextEngines": [
       "gbrain-context"
     ]
-  }
+  },
+  "id": "gbrain-context-engine"
 }
