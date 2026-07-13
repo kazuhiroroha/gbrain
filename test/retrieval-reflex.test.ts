@@ -15,9 +15,19 @@ import { renderPointerBlock, resolveEntitiesToPointers } from '../src/core/conte
 import { extractCandidates } from '../src/core/context/entity-salience.ts';
 import { createGBrainContextEngine } from '../src/core/context-engine.ts';
 import { disposeReflex } from '../src/core/context/reflex.ts';
+import { resolveAuthorizedRequest } from '../src/mcp/server.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../src/core/takes-fence.ts';
 
 let engine: PGLiteEngine;
+
+const ROUTING_OLD = JSON.stringify({
+  version: 1, state: 'old', roles: {
+    'business-shared': 'business-shared', 'business-evidence': 'business-evidence',
+    'openclaw-episodic': 'openclaw-episodic', 'owner-han-private': 'owner-han-private',
+    'owner-hamid-private': 'owner-hamid-private',
+    'owner-admin-450544615-private': 'owner-admin-450544615-private',
+  },
+});
 
 async function seed(slug: string, title: string, body: string, source = 'default') {
   await engine.executeRaw(
@@ -183,7 +193,89 @@ describe('context-engine assemble() — Retrieval Reflex integration', () => {
   const REFLEX_ON = {
     GBRAIN_RETRIEVAL_REFLEX: 'true',
     GBRAIN_OPENCLAW_PRINCIPALS_JSON: JSON.stringify({ version: 1, principals: { 'telegram:111': 'han' } }),
+    GBRAIN_OPENCLAW_SOURCE_ROUTING_JSON: ROUTING_OLD,
   };
+
+  test('shadow queries v2 separately, observes safe slugs, and never injects shadow text', async () => {
+    const observed: unknown[] = [];
+    const calls: readonly string[][] = [];
+    await withEnv({
+      ...REFLEX_ON,
+      GBRAIN_OPENCLAW_SOURCE_ROUTING_JSON: REFLEX_ON.GBRAIN_OPENCLAW_SOURCE_ROUTING_JSON.replace('"old"', '"shadow"'),
+    }, async () => {
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-shadow',
+        shadowObservationSink: (row) => observed.push(row),
+        resolveEntities: async (_candidates, opts) => {
+          (calls as string[][]).push([...opts.sourceIds]);
+          return opts.sourceIds.includes('business-shared-v2')
+            ? { pointers: [{ display: 'Never Inject', slug: 'private/never-inject', source_id: 'business-shared-v2', synopsis: 'prompt payload', arm: 'alias', confidence: 0.9 }], text: '- business-shared-v2:private/never-inject PROMPT PAYLOAD' }
+            : { pointers: [{ display: 'Visible', slug: 'people/visible', source_id: 'business-shared', synopsis: 'safe', arm: 'alias', confidence: 0.9 }], text: '- business-shared:people/visible' };
+        },
+      });
+      const result = await ce.assemble({
+        sessionId: 'shadow', requesterContext: { chatType: 'direct', messageProvider: 'telegram', senderId: '111' },
+        messages: [{ role: 'user', content: 'tell me about Alice Example' }],
+      });
+      expect(result.systemPromptAddition).toContain('business-shared:people/visible');
+      expect(result.systemPromptAddition).not.toContain('never-inject');
+    });
+    expect(calls).toEqual([
+      ['business-shared', 'business-evidence', 'openclaw-episodic', 'owner-han-private'],
+      ['business-shared-v2'],
+    ]);
+    expect(observed).toEqual([{
+      schema: 'gbrain-shadow-observation/v1', state: 'shadow',
+      primarySource: 'business-shared', shadowSource: 'business-shared-v2',
+      slugs: ['business-shared-v2:private/never-inject'],
+    }]);
+  });
+
+  test('malformed routing and unknown requesters perform no primary or shadow retrieval', async () => {
+    for (const [routing, requesterContext] of [
+      ['{', { chatType: 'direct', messageProvider: 'telegram', senderId: '111' }],
+      [REFLEX_ON.GBRAIN_OPENCLAW_SOURCE_ROUTING_JSON, { chatType: 'direct', messageProvider: 'telegram', senderId: '999' }],
+    ] as const) {
+      let calls = 0;
+      await withEnv({ ...REFLEX_ON, GBRAIN_OPENCLAW_SOURCE_ROUTING_JSON: routing }, async () => {
+        const ce = createGBrainContextEngine({ resolveEntities: async () => { calls++; return null; } });
+        await ce.assemble({ sessionId: 'denied', requesterContext, messages: [{ role: 'user', content: 'Alice Example' }] });
+      });
+      expect(calls).toBe(0);
+    }
+  });
+
+  test('group shadows only shared v2 and a shadow failure cannot alter the primary result', async () => {
+    const observed: unknown[] = [];
+    const calls: string[][] = [];
+    await withEnv({
+      ...REFLEX_ON,
+      GBRAIN_OPENCLAW_SOURCE_ROUTING_JSON: ROUTING_OLD.replace('"old"', '"shadow"'),
+    }, async () => {
+      const ce = createGBrainContextEngine({
+        shadowObservationSink: (row) => observed.push(row),
+        resolveEntities: async (_candidates, opts) => {
+          calls.push([...opts.sourceIds]);
+          if (opts.sourceIds.includes('business-shared-v2')) throw new Error('secret shadow failure detail');
+          return {
+            pointers: [{ display: 'Visible', slug: 'people/visible', source_id: 'business-shared', synopsis: 'safe', arm: 'alias', confidence: 0.9 }],
+            text: '- business-shared:people/visible',
+          };
+        },
+      });
+      const result = await ce.assemble({
+        sessionId: 'group-shadow', requesterContext: { chatType: 'group' },
+        messages: [{ role: 'user', content: 'tell me about Alice Example' }],
+      });
+      expect(result.systemPromptAddition).toContain('business-shared:people/visible');
+      expect(result.systemPromptAddition).not.toContain('secret shadow failure detail');
+    });
+    expect(calls).toEqual([['business-shared', 'business-evidence'], ['business-shared-v2']]);
+    expect(observed).toEqual([{
+      schema: 'gbrain-shadow-observation/v1', state: 'shadow',
+      primarySource: 'business-shared', shadowSource: 'business-shared-v2', slugs: [],
+    }]);
+  });
 
   test('regression: a named entity with a page surfaces a pointer (host resolver path)', async () => {
     await withEnv(REFLEX_ON, async () => {
@@ -295,6 +387,7 @@ describe('v0.43 (#2095) — rolling window extraction through assemble()', () =>
   const REFLEX_ON = {
     GBRAIN_RETRIEVAL_REFLEX: 'true',
     GBRAIN_OPENCLAW_PRINCIPALS_JSON: JSON.stringify({ version: 1, principals: { 'telegram:111': 'han' } }),
+    GBRAIN_OPENCLAW_SOURCE_ROUTING_JSON: ROUTING_OLD,
   };
 
   test('entity named ONLY in a previous assistant turn yields a pointer now', async () => {
@@ -460,9 +553,30 @@ describe('ambient-channel event logging (codex D11 — accept-side logDeliveredR
 });
 
 describe('serve IPC wiring — suppression passthrough + reflex-channel logging (review hardening)', () => {
+  test('pure MCP handler discards shadow text and emits only the data observation', async () => {
+    await seed('people/alice-example', 'Alice Example', 'old primary', 'business-shared');
+    await seed('people/alice-example', 'Alice Example', 'new shadow', 'business-shared-v2');
+    const observed: unknown[] = [];
+    const block = await resolveAuthorizedRequest(engine, {
+      candidates: extractCandidates('tell me about Alice Example'),
+      requesterContext: { chatType: 'group' },
+      sourceIds: ['business-shared', 'business-evidence'],
+      routingState: 'shadow',
+      shadowSource: 'business-shared-v2',
+    }, (row) => observed.push(row));
+    expect(block?.text).toContain('business-shared:people/alice-example');
+    expect(block?.text).not.toContain('business-shared-v2');
+    expect(observed).toEqual([{
+      schema: 'gbrain-shadow-observation/v1', state: 'shadow',
+      primarySource: 'business-shared', shadowSource: 'business-shared-v2',
+      slugs: ['business-shared-v2:people/alice-example'],
+    }]);
+  });
+
   test('the IPC round-trip honors slug-only suppression and logs channel=reflex', async () => {
     await withEnv({
       GBRAIN_OPENCLAW_PRINCIPALS_JSON: JSON.stringify({ version: 1, principals: {} }),
+      GBRAIN_OPENCLAW_SOURCE_ROUTING_JSON: ROUTING_OLD,
     }, async () => {
     const { startResolveIpcServer, resolveViaIpc, resolveSocketPath, IPC_UNAVAILABLE } =
       await import('../src/core/context/resolve-ipc.ts');

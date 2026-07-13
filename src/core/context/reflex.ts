@@ -34,6 +34,8 @@ import {
 import { resolveViaIpc, resolveSocketPath, IPC_UNAVAILABLE } from './resolve-ipc.ts';
 import { normalizeSourceIds } from './source-access-policy.ts';
 import type { RequesterContext } from './source-access-policy.ts';
+import { buildShadowObservation, type ShadowObservationSink } from './shadow-observer.ts';
+import type { SourceRoutingState } from './source-routing.ts';
 
 /** Per-turn resolver options shared by every rung of the ladder. */
 export interface ResolveEntitiesOpts {
@@ -79,6 +81,9 @@ export interface ReflexParams {
   resolveEntities?: ResolveEntitiesFn;
   sourceIds: readonly string[];
   requesterContext: Readonly<RequesterContext>;
+  routingState: SourceRoutingState;
+  shadowSource?: string;
+  shadowObservationSink?: ShadowObservationSink;
 }
 
 /** Default extraction window (turns). 1 = legacy current-turn-only. */
@@ -146,6 +151,24 @@ export async function buildReflexAddition(params: ReflexParams): Promise<string 
       sourceIds,
     };
     const block = await withTimeout(resolve(params, cfg, candidates, opts), TIMEOUT_MS);
+
+    if (params.shadowSource && params.routingState === 'shadow' && params.shadowObservationSink
+      && (params.resolveEntities || isPostgres(cfg))) {
+      const primarySource = opts.sourceIds.find((id) => id === 'business-shared') ?? opts.sourceIds[0];
+      let pointers: PointerBlock['pointers'] = [];
+      try {
+        const shadow = await withTimeout(resolve(params, cfg, candidates, { ...opts, sourceIds: [params.shadowSource!] }), TIMEOUT_MS);
+        pointers = shadow?.pointers ?? [];
+      } catch {
+        process.stderr.write('[gbrain-context] shadow_resolver_failed\n');
+      }
+      try {
+        params.shadowObservationSink(buildShadowObservation({
+          state: 'shadow', primarySource, shadowSource: params.shadowSource, pointers,
+        }));
+      } catch { /* observation must never affect primary retrieval */ }
+    }
+
     if (!block || !block.pointers.length) return null;
 
     // Accept-side reflex-channel logging (red-team): the block survived the

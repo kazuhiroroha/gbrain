@@ -25,6 +25,7 @@ import { join } from 'node:path';
 import type { EntityCandidate } from './entity-salience.ts';
 import type { PointerBlock } from './retrieval-reflex.ts';
 import { resolveSourceAccess, type RequesterContext } from './source-access-policy.ts';
+import { parseSourceRouting, resolvePhysicalSources, type SourceRoutingState } from './source-routing.ts';
 
 const SOCK_NAME = '.gbrain-resolve.sock';
 const CLIENT_TIMEOUT_MS = 250;
@@ -39,6 +40,8 @@ export interface ResolveRequest {
   maxPointers?: number;
   sourceIds: readonly string[];
   requesterContext: Readonly<RequesterContext>;
+  routingState: SourceRoutingState;
+  shadowSource?: string;
   /** v0.43 (#2095, codex D7): suppression mode — 'slug-only' under windowing. */
   suppression?: 'slug-and-title' | 'slug-only';
 }
@@ -81,6 +84,7 @@ export function authorizeResolveRequest(
   input: unknown,
   principalsRaw = process.env.GBRAIN_OPENCLAW_PRINCIPALS_JSON,
   serverToken = process.env.GBRAIN_REFLEX_IPC_TOKEN,
+  routingRaw = process.env.GBRAIN_OPENCLAW_SOURCE_ROUTING_JSON,
 ): ResolveRequest | null {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
   const raw = input as Record<string, unknown>;
@@ -108,15 +112,21 @@ export function authorizeResolveRequest(
 
   const requesterContext = requester as Readonly<RequesterContext>;
   const access = resolveSourceAccess(requesterContext, principalsRaw);
-  // Task 2 maps logical roles to physical source IDs before retrieval.
   if (!access.logicalRoles.length) return null;
   const needsPrivate = access.logicalRoles.some((id) => !SHARED.includes(id as typeof SHARED[number]));
-  let sourceIds: readonly string[] = access.logicalRoles;
+  let logicalRoles = access.logicalRoles;
   if (needsPrivate) {
-    if (!validToken(serverToken)) sourceIds = SHARED;
+    if (!validToken(serverToken)) logicalRoles = SHARED;
     else if (!tokenMatches(raw.ipcToken, serverToken)) return null;
   }
-  return { candidates, requesterContext, sourceIds, priorContextText: raw.priorContextText as string | undefined,
+  const routing = parseSourceRouting(routingRaw);
+  const sourceIds = resolvePhysicalSources(logicalRoles, routing);
+  if (!routing || !sourceIds.length) return null;
+  const shadowSource = routing.state === 'shadow' && logicalRoles.includes('business-shared')
+    ? routing.shadow?.physicalSourceId
+    : undefined;
+  return { candidates, requesterContext, sourceIds, routingState: routing.state, shadowSource,
+    priorContextText: raw.priorContextText as string | undefined,
     maxPointers: raw.maxPointers as number | undefined, suppression: raw.suppression as ResolveRequest['suppression'] };
 }
 

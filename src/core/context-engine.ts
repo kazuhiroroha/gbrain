@@ -17,6 +17,8 @@ import { readFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { buildReflexAddition, warmReflex, type ResolveEntitiesFn as ReflexResolveEntitiesFn } from './context/reflex.ts';
 import { resolveSourceAccess, type RequesterContext } from './context/source-access-policy.ts';
+import { parseSourceRouting, resolvePhysicalSources } from './context/source-routing.ts';
+import type { ShadowObservationSink } from './context/shadow-observer.ts';
 // Types inlined from openclaw/plugin-sdk to avoid hard dependency during development.
 // At runtime inside OpenClaw, the real SDK is available; these types ensure build compat.
 
@@ -644,6 +646,8 @@ export function createGBrainContextEngine(ctx: {
    * PGLite. Absent → the engine falls to the serve IPC / Postgres-direct ladder.
    */
   resolveEntities?: ReflexResolveEntitiesFn;
+  /** Data-only test/telemetry seam. No default file sink is installed. */
+  shadowObservationSink?: ShadowObservationSink;
 }): ContextEngine {
   const workspaceDir = ctx.workspaceDir ?? process.cwd();
   // Warm the Postgres connection ahead of the first salient turn (no-op for
@@ -682,8 +686,12 @@ export function createGBrainContextEngine(ctx: {
       // fail-open, time-bounded — returns null (no addition) on any error or when
       // nothing salient resolves. Detect + point, never auto-dump bodies.
       const access = resolveSourceAccess(requesterContext);
-      // Task 2 maps logical roles to physical source IDs before retrieval.
-      const sourceIds = access.logicalRoles;
+      const routing = parseSourceRouting(process.env.GBRAIN_OPENCLAW_SOURCE_ROUTING_JSON);
+      const sourceIds = resolvePhysicalSources(access.logicalRoles, routing);
+      const shadowSource = routing?.state === 'shadow'
+        && access.logicalRoles.includes('business-shared')
+        ? routing.shadow?.physicalSourceId
+        : undefined;
       const reflexAddition = sourceIds.length ? await buildReflexAddition({
         workspaceDir,
         currentUserText: getLastUserText(messages),
@@ -694,6 +702,9 @@ export function createGBrainContextEngine(ctx: {
         resolveEntities: ctx.resolveEntities,
         sourceIds,
         requesterContext: requesterContext!,
+        routingState: routing!.state,
+        shadowSource,
+        shadowObservationSink: ctx.shadowObservationSink,
       }) : null;
 
       // 3. Combine: live context + memory prompt + reflex pointers
