@@ -29,10 +29,20 @@ import { slugify } from '../entities/resolve.ts';
 import { stripTakesFence } from '../takes-fence.ts';
 import { stripFactsFence } from '../facts-fence.ts';
 import type { EntityCandidate } from './entity-salience.ts';
+import { normalizeSourceIds } from './source-access-policy.ts';
 
 /** Default cap on pointers injected per turn (config: retrieval_reflex_max_pointers). */
 export const DEFAULT_MAX_POINTERS = 3;
 const SYNOPSIS_MAX = 160;
+const SAFE_SOURCE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+const SAFE_SLUG = /^[a-z0-9][a-z0-9._/-]{0,255}$/;
+
+function safePointerKey(sourceId: string, slug: string): string | null {
+  if (!SAFE_SOURCE_ID.test(sourceId) || !SAFE_SLUG.test(slug) || slug.includes('//')) return null;
+  const segments = slug.split('/');
+  if (segments.some((segment) => segment === '.' || segment === '..')) return null;
+  return `${sourceId}:${slug}`;
+}
 
 /** Which resolution arm produced a pointer (provenance → honest confidence). */
 export type ResolveArm = 'alias' | 'title' | 'slug-suffix';
@@ -103,7 +113,7 @@ export interface ResolvePointersOpts {
    * (federated array > scalar). Alias arm loops per source; the title/slug
    * arm uses source_id = ANY(...) in one query.
    */
-  sourceIds?: string[];
+  sourceIds?: readonly string[];
 }
 
 interface PageRow {
@@ -160,7 +170,8 @@ export async function resolveEntitiesToPointers(
   if (!aliasNorms.length) return null;
 
   // Federated scope (v0.43 #2095): explicit sourceIds win over the scalar.
-  const sourceIds = opts.sourceIds?.length ? opts.sourceIds : [sourceId];
+  const sourceIds = normalizeSourceIds(opts.sourceIds ?? [sourceId]);
+  if (!sourceIds.length) return null;
 
   // Ordered set of resolved (source, slug) pairs with arm provenance —
   // alias hits pushed first → higher confidence.
@@ -215,6 +226,25 @@ export async function resolveEntitiesToPointers(
   } catch {
     rows = [];
   }
+  // SQL row order is undefined. Fold the title/slug arm with the same explicit
+  // source-then-candidate semantics as the alias arm before dedupe or capping.
+  // Alias remains the preferred arm globally; this ordering applies within
+  // the title/slug arm only.
+  const sourceRank = new Map(sourceIds.map((id, i) => [id, i]));
+  const candidateRank = (row: PageRow): number => {
+    const titleIdx = titlesLc.indexOf((row.title ?? '').toLowerCase());
+    if (titleIdx >= 0) return titleIdx;
+    const tail = row.slug.includes('/') ? row.slug.slice(row.slug.lastIndexOf('/') + 1) : row.slug;
+    const slugIdx = exactSlugs.findIndex((slug) => slug === row.slug || slug === tail);
+    return slugIdx >= 0 ? slugIdx : Number.MAX_SAFE_INTEGER;
+  };
+  rows.sort((a, b) =>
+    (sourceRank.get(a.source_id) ?? Number.MAX_SAFE_INTEGER) -
+      (sourceRank.get(b.source_id) ?? Number.MAX_SAFE_INTEGER) ||
+    candidateRank(a) - candidateRank(b) ||
+    a.slug.localeCompare(b.slug) ||
+    a.source_id.localeCompare(b.source_id),
+  );
   // Hydrate alias-resolved pages too (their bodies for the synopsis) if not in rows.
   const rowByKey = new Map<string, PageRow>();
   for (const r of rows) rowByKey.set(keyOf(r.source_id, r.slug), r);
@@ -252,6 +282,7 @@ export async function resolveEntitiesToPointers(
   const suppression = opts.suppression ?? 'slug-and-title';
   const pointers: ReflexPointer[] = [];
   for (const { slug, source_id, arm, matchedNorm } of resolved) {
+    if (!safePointerKey(source_id, slug)) continue;
     const row = rowByKey.get(keyOf(source_id, slug));
     if (!row) continue;
     // Suppression: already present in PRIOR context. The current turn is
@@ -333,8 +364,8 @@ export function renderPointerBlock(pointers: ReflexPointer[]): string {
     '',
   ];
   for (const p of pointers) {
-    const syn = p.synopsis ? ` — ${p.synopsis}` : '';
-    lines.push(`- **${p.display}** → \`${p.slug}\`${syn} (use get_page before relying on details)`);
+    const key = safePointerKey(p.source_id, p.slug);
+    if (key) lines.push(`- Brain page: \`${key}\` (use get_page before relying on details)`);
   }
   return lines.join('\n');
 }

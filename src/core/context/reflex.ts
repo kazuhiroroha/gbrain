@@ -32,6 +32,8 @@ import {
   type PointerBlock,
 } from './retrieval-reflex.ts';
 import { resolveViaIpc, resolveSocketPath, IPC_UNAVAILABLE } from './resolve-ipc.ts';
+import { normalizeSourceIds } from './source-access-policy.ts';
+import type { RequesterContext } from './source-access-policy.ts';
 
 /** Per-turn resolver options shared by every rung of the ladder. */
 export interface ResolveEntitiesOpts {
@@ -39,6 +41,8 @@ export interface ResolveEntitiesOpts {
   maxPointers?: number;
   /** v0.43 (#2095): 'slug-only' under windowing — see ResolvePointersOpts. */
   suppression?: 'slug-and-title' | 'slug-only';
+  /** Exact fail-closed source scope selected from trusted requester metadata. */
+  sourceIds: readonly string[];
 }
 
 /**
@@ -73,6 +77,8 @@ export interface ReflexParams {
   windowTurns?: WindowTurn[];
   /** Host-provided resolver, if the OpenClaw plugin contract supplied one. */
   resolveEntities?: ResolveEntitiesFn;
+  sourceIds: readonly string[];
+  requesterContext: Readonly<RequesterContext>;
 }
 
 /** Default extraction window (turns). 1 = legacy current-turn-only. */
@@ -117,6 +123,8 @@ function maxPointers(cfg: GBrainConfig | null): number {
  */
 export async function buildReflexAddition(params: ReflexParams): Promise<string | null> {
   try {
+    const sourceIds = normalizeSourceIds(params.sourceIds);
+    if (!sourceIds.length) return null;
     const cfg = loadConfig();
     if (!reflexEnabled(cfg)) return null;
 
@@ -135,6 +143,7 @@ export async function buildReflexAddition(params: ReflexParams): Promise<string 
       priorContextText: params.priorContextText,
       maxPointers: maxPointers(cfg),
       suppression: windowed ? 'slug-only' : 'slug-and-title',
+      sourceIds,
     };
     const block = await withTimeout(resolve(params, cfg, candidates, opts), TIMEOUT_MS);
     if (!block || !block.pointers.length) return null;
@@ -171,16 +180,21 @@ async function resolve(
   // 2. PGLite → serve resolve IPC.
   if (cfg?.engine === 'pglite' && cfg.database_path) {
     const sock = resolveSocketPath(cfg.database_path);
-    const r = await resolveViaIpc(sock, { candidates, ...opts });
+    const r = await resolveViaIpc(sock, {
+      candidates,
+      requesterContext: params.requesterContext,
+      priorContextText: opts.priorContextText,
+      maxPointers: opts.maxPointers,
+      suppression: opts.suppression,
+      ipcToken: process.env.GBRAIN_REFLEX_IPC_TOKEN,
+    });
     return r === IPC_UNAVAILABLE ? null : r;
   }
   // 3. Postgres → cached direct connection.
   if (isPostgres(cfg)) {
     const engine = await getPostgresEngine(cfg);
     if (!engine) return null;
-    const { resolveSourceId } = await import('../source-resolver.ts');
-    const sourceId = await resolveSourceId(engine, null, params.workspaceDir);
-    return resolveEntitiesToPointers(engine, sourceId, candidates, opts);
+    return resolveEntitiesToPointers(engine, opts.sourceIds[0], candidates, opts);
   }
   // 4. Disabled (PGLite with no serve / unknown engine). Policy skill carries.
   return null;

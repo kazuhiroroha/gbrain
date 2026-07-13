@@ -16,6 +16,7 @@
 import { readFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { buildReflexAddition, warmReflex, type ResolveEntitiesFn as ReflexResolveEntitiesFn } from './context/reflex.ts';
+import { resolveSourceAccess, type RequesterContext } from './context/source-access-policy.ts';
 // Types inlined from openclaw/plugin-sdk to avoid hard dependency during development.
 // At runtime inside OpenClaw, the real SDK is available; these types ensure build compat.
 
@@ -61,6 +62,7 @@ export interface ContextEngine {
     citationsMode?: string;
     model?: string;
     prompt?: string;
+    requesterContext?: Readonly<RequesterContext>;
   }): Promise<AssembleResult>;
   compact(params: {
     sessionId: string;
@@ -237,8 +239,7 @@ const AIRPORT_TZ: Record<string, string> = {
   LIS: 'Europe/Lisbon', BCN: 'Europe/Madrid',
 };
 
-const DEFAULT_TZ = 'US/Pacific';
-const DEFAULT_HOME = 'San Francisco';
+const HOME_TZ = 'US/Pacific';
 /**
  * Sentinel `tz` value emitted when an active flight points to an airport not in
  * AIRPORT_TZ. Pre-v0.32.5 this branch silently fell back to US/Pacific and
@@ -315,7 +316,7 @@ interface LiveContext {
     source: string;
   };
   /** Whether the user has flagged themselves awake (heartbeat.garryAwake). */
-  userAwake: boolean;
+  userAwake: boolean | null;
   /** Whether the wall-clock is in late-night hours (23:00–08:00 local). FALSE when timezone is unknown. */
   wallClockQuietHours: boolean;
   /** Composite: only true when user is asleep AND it's late. FALSE when timezone is unknown. */
@@ -355,13 +356,22 @@ function getTimeInTz(tz: string): { iso: string; dayOfWeek: string; hour: number
   return { iso, dayOfWeek, hour: localH };
 }
 
+function isValidTimezone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function resolveLocation(
   hb: HeartbeatState | null,
   flights: FlightData | null,
 ): { city: string; tz: string; source: string } {
-  if (hb?.currentLocation?.timezone) {
+  if (hb?.currentLocation?.timezone && isValidTimezone(hb.currentLocation.timezone)) {
     return {
-      city: hb.currentLocation.city ?? DEFAULT_HOME,
+      city: hb.currentLocation.city ?? 'unknown',
       tz: hb.currentLocation.timezone,
       source: hb.currentLocation.source ?? 'heartbeat',
     };
@@ -388,7 +398,7 @@ function resolveLocation(
     };
   }
 
-  return { city: DEFAULT_HOME, tz: DEFAULT_TZ, source: 'default' };
+  return { city: 'unknown', tz: UNKNOWN_TZ, source: 'unavailable' };
 }
 
 /** Parse a calendar event time string into a Date. Handles ISO and date-only formats. */
@@ -492,25 +502,28 @@ function generateLiveContext(workspaceDir: string): LiveContext {
   // an unmapped airport). Pre-v0.32.5 the engine fell back to US/Pacific and
   // injected a confidently-wrong local time. Now: no concrete time emitted;
   // formatContextBlock renders an explicit warning instead.
-  const tzKnown = location.tz !== UNKNOWN_TZ;
-  const time = tzKnown ? getTimeInTz(location.tz) : null;
+  let tzKnown = location.tz !== UNKNOWN_TZ;
+  let time: ReturnType<typeof getTimeInTz> | null = null;
+  if (tzKnown) {
+    try { time = getTimeInTz(location.tz); } catch { location.tz = UNKNOWN_TZ; tzKnown = false; }
+  }
 
   // User-state vs wall-clock are independent signals; split them so consumers
   // can decide their own policy. Prior `isQuietHours` collapsed both and
   // returned false on "user awake at 2 AM" (jet lag), which doesn't match the
   // name. Kept derived `quietHoursActive` for the existing format-block use.
-  const userAwake = hb?.garryAwake ?? true;
+  const userAwake = typeof hb?.garryAwake === 'boolean' ? hb.garryAwake : null;
   // When timezone is unknown we cannot reason about wall-clock quiet hours.
   // Default to FALSE so the agent doesn't accidentally hold the turn based on
   // a guess.
   const wallClockQuietHours = time ? (time.hour >= 23 || time.hour < 8) : false;
-  const quietHoursActive = !userAwake && wallClockQuietHours;
+  const quietHoursActive = userAwake === false && wallClockQuietHours;
 
   // Home time when traveling
   let homeTime: string | null = null;
-  if (location.tz !== DEFAULT_TZ && location.tz !== 'US/Pacific' && location.tz !== 'America/Los_Angeles') {
+  if (tzKnown && location.tz !== HOME_TZ && location.tz !== 'America/Los_Angeles') {
     const ptFmt = new Intl.DateTimeFormat('en-US', {
-      timeZone: DEFAULT_TZ,
+      timeZone: HOME_TZ,
       hour: 'numeric', minute: '2-digit', hour12: true, weekday: 'short',
     });
     homeTime = ptFmt.format(new Date()) + ' PT';
@@ -582,12 +595,12 @@ function formatContextBlock(ctx: LiveContext): string {
   lines.push(`- **Location:** ${ctx.location.city} (source: ${ctx.location.source})`);
 
   if (ctx.homeTime) {
-    lines.push(`- **Home (SF):** ${ctx.homeTime}`);
+    lines.push(`- **Home time:** ${ctx.homeTime}`);
   }
   if (ctx.activeTravel) {
     lines.push(`- **Active travel:** ${ctx.activeTravel}`);
   }
-  if (!ctx.userAwake) {
+  if (ctx.userAwake === false) {
     lines.push(`- **User awake:** no (quiet hours ${ctx.quietHoursActive ? 'active' : 'paused'})`);
   }
 
@@ -650,7 +663,7 @@ export function createGBrainContextEngine(ctx: {
       return { ingested: true };
     },
 
-    async assemble({ messages, tokenBudget, availableTools, citationsMode }) {
+    async assemble({ messages, tokenBudget, availableTools, citationsMode, requesterContext }) {
       // Lazy SDK load on first method call (was top-level await pre-L0-B).
       await ensureSdkLoaded();
 
@@ -668,7 +681,8 @@ export function createGBrainContextEngine(ctx: {
       // resolve to existing brain pages and inject compact pointers. Zero-LLM,
       // fail-open, time-bounded — returns null (no addition) on any error or when
       // nothing salient resolves. Detect + point, never auto-dump bodies.
-      const reflexAddition = await buildReflexAddition({
+      const access = resolveSourceAccess(requesterContext);
+      const reflexAddition = access.sourceIds.length ? await buildReflexAddition({
         workspaceDir,
         currentUserText: getLastUserText(messages),
         priorContextText: getPriorContextText(messages),
@@ -676,7 +690,9 @@ export function createGBrainContextEngine(ctx: {
         // named-antecedent follow-ups from recent turns now resolve too.
         windowTurns: getWindowTurns(messages),
         resolveEntities: ctx.resolveEntities,
-      });
+        sourceIds: access.sourceIds,
+        requesterContext: requesterContext!,
+      }) : null;
 
       // 3. Combine: live context + memory prompt + reflex pointers
       const parts = [contextBlock];

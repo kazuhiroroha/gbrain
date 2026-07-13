@@ -14,6 +14,7 @@ import {
   cleanupStaleSocket,
 } from '../core/context/resolve-ipc.ts';
 import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
+import { normalizeSourceIds } from '../core/context/source-access-policy.ts';
 
 export async function startMcpServer(engine: BrainEngine) {
   const server = new Server(
@@ -67,20 +68,18 @@ export async function startMcpServer(engine: BrainEngine) {
     const cfg = loadConfig();
     if (cfg?.engine === 'pglite' && cfg.database_path) {
       resolveSocket = resolveSocketPath(cfg.database_path);
-      const defaultSource = process.env.GBRAIN_SOURCE || 'default';
       resolveServer = await startResolveIpcServer(
         resolveSocket,
-        (req) =>
-          resolveEntitiesToPointers(
-            engine,
-            req.sourceId || defaultSource,
-            req.candidates ?? [],
-            {
+        (req) => {
+          const sourceIds = normalizeSourceIds(req.sourceIds ?? []);
+          if (!sourceIds.length) return Promise.resolve(null);
+          return resolveEntitiesToPointers(engine, sourceIds[0], req.candidates ?? [], {
               priorContextText: req.priorContextText,
               maxPointers: req.maxPointers,
               suppression: req.suppression,
-            },
-          ),
+              sourceIds,
+            });
+        },
         // The IPC resolve path IS the ambient reflex channel. Logging happens
         // at DELIVERY (post-write), not inside the resolver — a block the
         // client's 250ms budget abandoned was never injected, and counting it

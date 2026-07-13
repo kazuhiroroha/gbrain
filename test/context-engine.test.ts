@@ -76,11 +76,11 @@ describe('gbrain-context engine', () => {
     expect(result.systemPromptAddition).toContain('America/Toronto');
     expect(result.systemPromptAddition).toContain('Markham');
     // Should include home time since we're traveling (not US/Pacific)
-    expect(result.systemPromptAddition).toContain('Home (SF)');
+    expect(result.systemPromptAddition).toContain('Home time');
     expect(result.systemPromptAddition).toContain('PT');
   });
 
-  it('uses US/Pacific when no location set', async () => {
+  it('renders missing live state as unknown without confident identity/location/time defaults', async () => {
     tmpDir = makeWorkspace();
     const engine = createGBrainContextEngine({ workspaceDir: tmpDir });
 
@@ -89,9 +89,12 @@ describe('gbrain-context engine', () => {
       messages: [],
     });
 
-    expect(result.systemPromptAddition).toContain('San Francisco');
-    // Should NOT have home time (already home)
+    expect(result.systemPromptAddition).toContain('unknown');
+    expect(result.systemPromptAddition).not.toContain('Garry');
+    expect(result.systemPromptAddition).not.toContain('San Francisco');
+    expect(result.systemPromptAddition).not.toContain('US/Pacific');
     expect(result.systemPromptAddition).not.toContain('Home (SF)');
+    expect(result.systemPromptAddition).not.toContain('User awake');
   });
 
   it('passes messages through unchanged', async () => {
@@ -170,8 +173,9 @@ describe('gbrain-context engine', () => {
       messages: [],
     });
 
-    // Should still work with defaults
-    expect(result.systemPromptAddition).toContain('San Francisco');
+    // Missing state is explicit, never replaced by confident defaults.
+    expect(result.systemPromptAddition).toContain('unknown');
+    expect(result.systemPromptAddition).not.toContain('San Francisco');
     expect(result.systemPromptAddition).toContain('Live Context');
   });
 
@@ -364,7 +368,7 @@ describe('gbrain-context engine', () => {
     expect(result.systemPromptAddition).toContain('America/Toronto');
     expect(result.systemPromptAddition).toContain('flight:AC8');
     // Home time should appear because we're not in PT
-    expect(result.systemPromptAddition).toContain('Home (SF)');
+    expect(result.systemPromptAddition).toContain('Home time');
   });
 
   it('L0-A: active flight to an UNKNOWN airport emits NO concrete local time', async () => {
@@ -408,6 +412,16 @@ describe('gbrain-context engine', () => {
     expect(block).toContain('AI191');
     expect(block).toContain('BOM');
     expect(block).toContain('tz-unknown');
+  });
+
+  it('invalid heartbeat timezone downgrades to unknown without concrete time/day/home', async () => {
+    tmpDir = makeWorkspace({ heartbeat: { currentLocation: { city: 'Nowhere', timezone: 'Invalid/Timezone' } } });
+    const result = await createGBrainContextEngine({ workspaceDir: tmpDir }).assemble({ sessionId: 'bad-tz', messages: [] });
+    expect(result.systemPromptAddition).toContain('Timezone:** unknown');
+    expect(result.systemPromptAddition).not.toContain('Invalid/Timezone');
+    expect(result.systemPromptAddition).not.toContain('**Time:**');
+    expect(result.systemPromptAddition).not.toContain('**Day:**');
+    expect(result.systemPromptAddition).not.toContain('Home time');
   });
 
   it('C4: calendar event summary with prompt-injection payload is sanitized', async () => {

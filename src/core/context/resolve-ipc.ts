@@ -10,18 +10,21 @@
  * ends are gbrain code; raw SQL never crosses the wire (closes the trust hole).
  *
  * Protocol: newline-delimited JSON. One request line, one response line.
- *   req:  { candidates, priorContextText?, maxPointers?, sourceId? }
+ *   req:  { candidates, requesterContext, priorContextText?, maxPointers?, ipcToken? }
  *   resp: { ok: true, block: PointerBlock | null } | { ok: false, error }
  *
  * Local-only (unix socket on the brain's data dir, mode 0600) — no network
- * surface.
+ * surface. Same-UID socket access is not private-source authorization: the
+ * server recomputes requester policy and separately verifies the IPC token.
  */
 
 import net from 'node:net';
+import { timingSafeEqual } from 'node:crypto';
 import { existsSync, unlinkSync, statSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import type { EntityCandidate } from './entity-salience.ts';
 import type { PointerBlock } from './retrieval-reflex.ts';
+import { resolveSourceAccess, type RequesterContext } from './source-access-policy.ts';
 
 const SOCK_NAME = '.gbrain-resolve.sock';
 const CLIENT_TIMEOUT_MS = 250;
@@ -34,9 +37,86 @@ export interface ResolveRequest {
   candidates: EntityCandidate[];
   priorContextText?: string;
   maxPointers?: number;
-  sourceId?: string;
+  sourceIds: readonly string[];
+  requesterContext: Readonly<RequesterContext>;
   /** v0.43 (#2095, codex D7): suppression mode — 'slug-only' under windowing. */
   suppression?: 'slug-and-title' | 'slug-only';
+}
+
+export interface ResolveWireRequest {
+  candidates: EntityCandidate[];
+  requesterContext: Readonly<RequesterContext>;
+  priorContextText?: string;
+  maxPointers?: number;
+  suppression?: 'slug-and-title' | 'slug-only';
+  ipcToken?: string;
+}
+
+const WIRE_KEYS = new Set(['candidates', 'requesterContext', 'priorContextText', 'maxPointers', 'suppression', 'ipcToken']);
+const REQUESTER_KEYS = new Set(['messageChannel', 'messageProvider', 'chatType', 'senderId', 'senderIsOwner', 'groupId', 'agentAccountId', 'trigger']);
+const SHARED = ['business-shared', 'business-evidence'] as const;
+const MAX_TOKEN_BYTES = 512;
+
+function validToken(token: unknown): token is string {
+  return typeof token === 'string' && token.length > 0 && Buffer.byteLength(token) <= MAX_TOKEN_BYTES;
+}
+
+function tokenMatches(got: unknown, expected: string): boolean {
+  if (!validToken(got) || !validToken(expected)) return false;
+  const a = Buffer.from(got);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) {
+    timingSafeEqual(Buffer.alloc(b.length), b);
+    return false;
+  }
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * Validate an untrusted socket payload and recompute authorization server-side.
+ * The 0600 same-UID Unix socket is transport confinement, not private-source
+ * authorization; private/episodic access additionally requires the shared IPC token.
+ */
+export function authorizeResolveRequest(
+  input: unknown,
+  principalsRaw = process.env.GBRAIN_OPENCLAW_PRINCIPALS_JSON,
+  serverToken = process.env.GBRAIN_REFLEX_IPC_TOKEN,
+): ResolveRequest | null {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const raw = input as Record<string, unknown>;
+  if (Object.keys(raw).some((key) => !WIRE_KEYS.has(key))) return null;
+  if (!Array.isArray(raw.candidates) || raw.candidates.length > 12) return null;
+  const candidates: EntityCandidate[] = [];
+  for (const candidate of raw.candidates) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+    const c = candidate as Record<string, unknown>;
+    if (Object.keys(c).some((key) => key !== 'display' && key !== 'query')) return null;
+    if (typeof c.display !== 'string' || typeof c.query !== 'string' || !c.display || !c.query || c.display.length > 256 || c.query.length > 256) return null;
+    candidates.push({ display: c.display, query: c.query });
+  }
+  if (!raw.requesterContext || typeof raw.requesterContext !== 'object' || Array.isArray(raw.requesterContext)) return null;
+  const requester = raw.requesterContext as Record<string, unknown>;
+  if (Object.keys(requester).some((key) => !REQUESTER_KEYS.has(key))) return null;
+  for (const [key, value] of Object.entries(requester)) {
+    if (key === 'senderIsOwner') { if (typeof value !== 'boolean') return null; }
+    else if (typeof value !== 'string' || value.length > 256) return null;
+  }
+  if (raw.priorContextText !== undefined && (typeof raw.priorContextText !== 'string' || raw.priorContextText.length > 20_000)) return null;
+  if (raw.suppression !== undefined && raw.suppression !== 'slug-and-title' && raw.suppression !== 'slug-only') return null;
+  if (raw.maxPointers !== undefined && (!Number.isInteger(raw.maxPointers) || (raw.maxPointers as number) < 1 || (raw.maxPointers as number) > 20)) return null;
+  if (raw.ipcToken !== undefined && !validToken(raw.ipcToken)) return null;
+
+  const requesterContext = requester as Readonly<RequesterContext>;
+  const access = resolveSourceAccess(requesterContext, principalsRaw);
+  if (!access.sourceIds.length) return null;
+  const needsPrivate = access.sourceIds.some((id) => !SHARED.includes(id as typeof SHARED[number]));
+  let sourceIds = access.sourceIds;
+  if (needsPrivate) {
+    if (!validToken(serverToken)) sourceIds = SHARED;
+    else if (!tokenMatches(raw.ipcToken, serverToken)) return null;
+  }
+  return { candidates, requesterContext, sourceIds, priorContextText: raw.priorContextText as string | undefined,
+    maxPointers: raw.maxPointers as number | undefined, suppression: raw.suppression as ResolveRequest['suppression'] };
 }
 
 export type ResolveHandler = (req: ResolveRequest) => Promise<PointerBlock | null>;
@@ -53,7 +133,7 @@ export function resolveSocketPath(dataDir: string): string {
  */
 export async function resolveViaIpc(
   socketPath: string,
-  req: ResolveRequest,
+  req: ResolveWireRequest,
 ): Promise<PointerBlock | null | typeof IPC_UNAVAILABLE> {
   if (!existsSync(socketPath)) return IPC_UNAVAILABLE;
   return new Promise((resolve) => {
@@ -124,7 +204,8 @@ export async function startResolveIpcServer(
         let resp: string;
         let delivered: { block: PointerBlock; req: ResolveRequest } | null = null;
         try {
-          const req = JSON.parse(line) as ResolveRequest;
+          const req = authorizeResolveRequest(JSON.parse(line));
+          if (!req) throw new Error('invalid resolve request');
           const block = await handler(req);
           resp = JSON.stringify({ ok: true, block });
           if (block) delivered = { block, req };
