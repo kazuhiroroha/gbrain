@@ -682,7 +682,9 @@ export function createGBrainContextEngine(ctx: {
       // fail-open, time-bounded — returns null (no addition) on any error or when
       // nothing salient resolves. Detect + point, never auto-dump bodies.
       const access = resolveSourceAccess(requesterContext);
-      const reflexAddition = access.sourceIds.length ? await buildReflexAddition({
+      // Task 2 maps logical roles to physical source IDs before retrieval.
+      const sourceIds = access.logicalRoles;
+      const reflexAddition = sourceIds.length ? await buildReflexAddition({
         workspaceDir,
         currentUserText: getLastUserText(messages),
         priorContextText: getPriorContextText(messages),
@@ -690,7 +692,7 @@ export function createGBrainContextEngine(ctx: {
         // named-antecedent follow-ups from recent turns now resolve too.
         windowTurns: getWindowTurns(messages),
         resolveEntities: ctx.resolveEntities,
-        sourceIds: access.sourceIds,
+        sourceIds,
         requesterContext: requesterContext!,
       }) : null;
 

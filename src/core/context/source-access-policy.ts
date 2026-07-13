@@ -1,3 +1,5 @@
+import type { LogicalSourceRole } from './source-routing.ts';
+
 export type OpenClawPrincipal = 'han' | 'hamid' | 'admin';
 
 export interface RequesterContext {
@@ -14,16 +16,16 @@ export interface RequesterContext {
 export interface SourceAccessDecision {
   readonly principal: OpenClawPrincipal | null;
   readonly contextKind: 'direct' | 'group-like' | 'unsupported';
-  readonly sourceIds: readonly string[];
+  readonly logicalRoles: readonly LogicalSourceRole[];
   readonly reason: string;
 }
 
-const DIRECT_SOURCES: Record<OpenClawPrincipal, readonly string[]> = {
+const DIRECT_SOURCES: Record<OpenClawPrincipal, readonly LogicalSourceRole[]> = {
   han: ['business-shared', 'business-evidence', 'openclaw-episodic', 'owner-han-private'],
   hamid: ['business-shared', 'business-evidence', 'owner-hamid-private'],
   admin: ['business-shared', 'business-evidence', 'owner-admin-450544615-private'],
 };
-const SHARED_SOURCES = ['business-shared', 'business-evidence'] as const;
+const SHARED_SOURCES = ['business-shared', 'business-evidence'] as const satisfies readonly LogicalSourceRole[];
 const GROUP_LIKE = new Set(['group', 'channel', 'thread']);
 const PROVIDER_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const SENDER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -43,10 +45,10 @@ export function normalizeSourceIds(sourceIds: readonly string[]): string[] {
 function decision(
   principal: OpenClawPrincipal | null,
   contextKind: SourceAccessDecision['contextKind'],
-  sourceIds: readonly string[],
+  logicalRoles: readonly LogicalSourceRole[],
   reason: string,
 ): SourceAccessDecision {
-  return Object.freeze({ principal, contextKind, sourceIds: Object.freeze([...sourceIds]), reason });
+  return Object.freeze({ principal, contextKind, logicalRoles: Object.freeze([...logicalRoles]), reason });
 }
 
 function parsePolicy(raw: string | undefined): ReadonlyMap<string, OpenClawPrincipal> | null {

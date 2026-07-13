@@ -108,9 +108,10 @@ export function authorizeResolveRequest(
 
   const requesterContext = requester as Readonly<RequesterContext>;
   const access = resolveSourceAccess(requesterContext, principalsRaw);
-  if (!access.sourceIds.length) return null;
-  const needsPrivate = access.sourceIds.some((id) => !SHARED.includes(id as typeof SHARED[number]));
-  let sourceIds = access.sourceIds;
+  // Task 2 maps logical roles to physical source IDs before retrieval.
+  if (!access.logicalRoles.length) return null;
+  const needsPrivate = access.logicalRoles.some((id) => !SHARED.includes(id as typeof SHARED[number]));
+  let sourceIds: readonly string[] = access.logicalRoles;
   if (needsPrivate) {
     if (!validToken(serverToken)) sourceIds = SHARED;
     else if (!tokenMatches(raw.ipcToken, serverToken)) return null;
