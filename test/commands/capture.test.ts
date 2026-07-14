@@ -8,7 +8,7 @@
  * gets the same write-through plumbing).
  */
 
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -16,6 +16,7 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import matter from 'gray-matter';
 import { runCapture, __testing } from '../../src/commands/capture.ts';
+import { configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
@@ -32,11 +33,19 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-small',
+    env: {},
+  });
   await resetPgliteState(engine);
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-capture-'));
   brainDir = path.join(tmpRoot, 'brain');
   fs.mkdirSync(brainDir, { recursive: true });
   await engine.setConfig('sync.repo_path', brainDir);
+});
+
+afterEach(() => {
+  resetGateway();
 });
 
 describe('capture — defaultSlug helper', () => {

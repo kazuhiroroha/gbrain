@@ -16,6 +16,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { hybridSearch } from '../src/core/search/hybrid.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import { runRetrievalQuality, parseQuestionsJsonl, type SearchFn } from '../src/eval/retrieval-quality/harness.ts';
 import { seedRelationalCorpus, RELATIONAL_QUESTIONS } from './fixtures/retrieval-quality/relational/corpus.ts';
 import { readFileSync } from 'fs';
@@ -24,13 +25,17 @@ import { join } from 'path';
 let eng: PGLiteEngine;
 
 beforeAll(async () => {
+  configureGateway({ env: {} });
   eng = new PGLiteEngine();
   await eng.connect({});
   await eng.initSchema();
   await seedRelationalCorpus(eng);
 }, 60_000);
 
-afterAll(async () => { await eng.disconnect(); });
+afterAll(async () => {
+  await eng.disconnect();
+  resetGateway();
+});
 
 const searchFnWith = (relationalRetrieval: boolean): SearchFn => async (q) => {
   const results = await hybridSearch(eng, q, { limit: 10, relationalRetrieval, expansion: false });

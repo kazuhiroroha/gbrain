@@ -22,6 +22,7 @@ import { describe, test, expect, beforeAll, afterAll, afterEach } from 'bun:test
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runFactsBackstop, runFactsPipeline } from '../src/core/facts/backstop.ts';
 import {
+  configureGateway,
   __setChatTransportForTests,
   resetGateway,
   type ChatResult,
@@ -49,6 +50,11 @@ afterEach(() => {
 const LONG_BODY = 'integration-test meeting note '.repeat(20);
 
 function chatStub(facts: Array<{ fact: string; kind: string; notability: 'high' | 'medium' | 'low'; entity?: string | null }>) {
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-small',
+    embedding_dimensions: 1536,
+    env: {},
+  });
   __setChatTransportForTests(async (): Promise<ChatResult> => ({
     text: JSON.stringify({
       facts: facts.map(f => ({

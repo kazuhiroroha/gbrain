@@ -19,11 +19,13 @@ import {
 } from '../src/core/minions/tools/brain-allowlist.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 import type { ToolCtx } from '../src/core/minions/types.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 const config: GBrainConfig = { engine: 'pglite' } as GBrainConfig;
 
 beforeAll(async () => {
+  configureGateway({ env: {} });
   engine = new PGLiteEngine();
   await engine.connect({ database_url: '' });
   await engine.initSchema();
@@ -31,6 +33,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   if (engine) await engine.disconnect();
+  resetGateway();
 }, 60_000);
 
 beforeEach(async () => {

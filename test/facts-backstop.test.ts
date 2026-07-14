@@ -14,6 +14,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runFactsBackstop } from '../src/core/facts/backstop.ts';
 import type { FactsBackstopCtx } from '../src/core/facts/backstop.ts';
 import {
+  configureGateway,
   __setChatTransportForTests,
   resetGateway,
   type ChatResult,
@@ -41,6 +42,10 @@ afterEach(() => {
 const LONG_BODY = 'this is a real meeting note longer than 80 chars '.repeat(3);
 
 function chatStub(facts: Array<{ fact: string; kind: string; notability: 'high' | 'medium' | 'low'; entity?: string | null }>) {
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-small',
+    env: {},
+  });
   __setChatTransportForTests(async (): Promise<ChatResult> => ({
     text: JSON.stringify({
       facts: facts.map(f => ({

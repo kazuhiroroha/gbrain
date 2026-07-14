@@ -126,9 +126,7 @@ describe('extractTakesFromDb', () => {
 describe('extractTakesFromPages', () => {
   let routedEngine: PGLiteEngine;
 
-  beforeEach(async () => {
-    resetGateway();
-    __setChatTransportForTests(null);
+  beforeAll(async () => {
     routedEngine = new PGLiteEngine();
     await routedEngine.connect({});
     await routedEngine.initSchema();
@@ -139,10 +137,18 @@ describe('extractTakesFromPages', () => {
     });
   });
 
-  afterEach(async () => {
+  afterAll(async () => {
+    await routedEngine.disconnect();
+  });
+
+  beforeEach(() => {
+    resetGateway();
+    __setChatTransportForTests(null);
+  });
+
+  afterEach(() => {
     __setChatTransportForTests(null);
     resetGateway();
-    await routedEngine.disconnect();
   });
 
   test('uses configured chat_model when no extractor model override is provided', async () => {
@@ -176,4 +182,3 @@ describe('extractTakesFromPages', () => {
     expect(seenModels).toEqual([undefined]);
   });
 });
-

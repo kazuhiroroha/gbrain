@@ -42,6 +42,7 @@ import {
 } from '../src/commands/notability-eval.ts';
 import { extractFactsFromTurn } from '../src/core/facts/extract.ts';
 import {
+  configureGateway,
   __setChatTransportForTests,
   resetGateway,
   type ChatResult,
@@ -226,6 +227,11 @@ describe('public-anonymized fixture — shape contract', () => {
  */
 describe('eval harness — precision@HIGH contract', () => {
   function makeChatStub(predictedTier: 'high' | 'medium' | 'low') {
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-small',
+      embedding_dimensions: 1536,
+      env: {},
+    });
     __setChatTransportForTests(async (): Promise<ChatResult> => ({
       text: JSON.stringify({
         facts: [{

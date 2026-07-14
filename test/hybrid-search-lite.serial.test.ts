@@ -18,6 +18,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { hybridSearchCached } from '../src/core/search/hybrid.ts';
 import type { PageInput, HybridSearchMeta } from '../src/core/types.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 const savedKey = process.env.OPENAI_API_KEY;
@@ -58,11 +59,16 @@ beforeAll(async () => {
   for (const p of pages) {
     await engine.putPage(p.slug, p.page);
   }
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-small',
+    env: {},
+  });
   // Force keyword-only fallback by unsetting the embedding provider key.
   delete process.env.OPENAI_API_KEY;
 });
 
 afterAll(async () => {
+  resetGateway();
   if (savedKey) process.env.OPENAI_API_KEY = savedKey;
   try { await engine.disconnect(); } catch { /* ignore */ }
 });

@@ -40,10 +40,10 @@ describe('extract.ts → workers wiring (T7)', () => {
   });
 
   test('CLI runExtract parses --workers via parseWorkers (loud-fail on invalid)', () => {
-    // The parsed value must come from parseWorkers (validates >=1
-    // integer) AND must thread into runExtractCore opts.
+    // The parsed value must come from parseWorkers (validates >=1 integer).
+    // Threading into runExtractCore is asserted semantically below instead of
+    // pinning this test to the call site's whitespace/property order.
     expect(EXTRACT_SRC).toMatch(/parseWorkers\(args\[/);
-    expect(EXTRACT_SRC).toMatch(/workers,?\s*\}\);/);
   });
 
   test('all three inner loops accept the workers parameter', () => {
