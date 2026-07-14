@@ -30,6 +30,7 @@ import { stripTakesFence } from '../takes-fence.ts';
 import { stripFactsFence } from '../facts-fence.ts';
 import type { EntityCandidate } from './entity-salience.ts';
 import { normalizeSourceIds } from './source-access-policy.ts';
+import { trackVolunteerEventWrite } from './volunteer-event-write-tracker.ts';
 
 /** Default cap on pointers injected per turn (config: retrieval_reflex_max_pointers). */
 export const DEFAULT_MAX_POINTERS = 3;
@@ -382,9 +383,9 @@ export function renderPointerBlock(pointers: ReflexPointer[]): string {
  */
 export function logDeliveredReflexPointers(engine: BrainEngine, pointers: ReflexPointer[]): void {
   if (!pointers.length) return;
-  void import('./volunteer-events.ts')
+  const write = import('./volunteer-events.ts')
     .then(({ logVolunteerEventsFireAndForget, volunteerEventRowsFrom }) => {
-      logVolunteerEventsFireAndForget(
+      return logVolunteerEventsFireAndForget(
         engine,
         volunteerEventRowsFrom(
           pointers.map((p) => ({ ...p, rationale: `${p.arm} match "${p.display}"` })),
@@ -395,4 +396,5 @@ export function logDeliveredReflexPointers(engine: BrainEngine, pointers: Reflex
     .catch(() => {
       /* telemetry only */
     });
+  trackVolunteerEventWrite(write);
 }

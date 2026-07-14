@@ -252,13 +252,17 @@ describe('v0.41.8.0 #1340 — PGLite WASM init classifier', () => {
 });
 
 describe('v0.42.43.0 #2095 — volunteer-events sink + cycle purge wiring (structural pins)', () => {
-  test('volunteer-events registers a background-work drainer (order 4)', () => {
+  test('volunteer-events tracker registers a background-work drainer (order 4)', () => {
     // Deleting this registration would silently drop volunteer events on
     // every CLI exit with no behavioral test failing — same pin class as the
-    // other four sinks above.
-    const src = readFileSync('src/core/context/volunteer-events.ts', 'utf8');
-    expect(src).toMatch(/registerBackgroundWorkDrainer\(\{[\s\S]*?name:\s*'volunteer-events'/);
-    expect(src).toMatch(/order:\s*4/);
+    // other four sinks above. The tracker is imported synchronously by the
+    // enqueue-owning module so registration exists before any dynamic import
+    // can schedule a write.
+    const eventsSrc = readFileSync('src/core/context/volunteer-events.ts', 'utf8');
+    const trackerSrc = readFileSync('src/core/context/volunteer-event-write-tracker.ts', 'utf8');
+    expect(eventsSrc).toMatch(/from '\.\/volunteer-event-write-tracker\.ts'/);
+    expect(trackerSrc).toMatch(/registerBackgroundWorkDrainer\(\{[\s\S]*?name:\s*'volunteer-events'/);
+    expect(trackerSrc).toMatch(/order:\s*4/);
   });
 
   test("the dream cycle's purge phase invokes purgeStaleVolunteerEvents and reports the count", () => {
